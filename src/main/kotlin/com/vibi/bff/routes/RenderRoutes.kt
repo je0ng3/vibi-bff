@@ -209,7 +209,7 @@ fun Route.renderRoutes(
             // SignedUrlService 검증 후 SeparationService 의 LocalStem.file 직접 매핑.
             // 외부 URL fallback 다운로드는 SSRF 위험으로 폐기 (resolveStemUrlToFile 참조).
             val resolvedDirectives = resolveSeparationDirectives(
-                config.separationDirectives, separationService, signedUrlService, principal?.userId,
+                config.separationDirectives, separationService, signedUrlService, objectStore, principal?.userId,
             )
 
             // inputFilesToCleanup tracks PER-REQUEST temp uploads. Cache-resident
@@ -307,7 +307,7 @@ fun Route.renderRoutes(
             }
 
             val resolvedDirectives = resolveSeparationDirectives(
-                config.separationDirectives, separationService, signedUrlService, principal?.userId,
+                config.separationDirectives, separationService, signedUrlService, objectStore, principal?.userId,
             )
 
             // asset cache 의 파일은 모든 job 의 공유 소유물 — 다른 동시 render 가 같은 키
@@ -402,6 +402,7 @@ private suspend fun resolveSeparationDirectives(
     directives: List<com.vibi.bff.model.SeparationDirectiveDto>,
     separationService: SeparationService,
     signedUrlService: SignedUrlService,
+    objectStore: ObjectStore?,
     callerUserId: UUID?,
 ): List<DirectiveWithStemFiles> {
     val resolved = mutableListOf<DirectiveWithStemFiles>()
@@ -411,6 +412,7 @@ private suspend fun resolveSeparationDirectives(
                 audioUrl = selection.audioUrl,
                 separationService = separationService,
                 signedUrlService = signedUrlService,
+                objectStore = objectStore,
                 callerUserId = callerUserId,
             )
             DirectiveStem(file = file, volume = selection.volume)
@@ -446,6 +448,7 @@ private suspend fun resolveStemUrlToFile(
     audioUrl: String,
     separationService: SeparationService,
     signedUrlService: SignedUrlService,
+    objectStore: ObjectStore?,
     callerUserId: UUID? = null,
 ): File {
     val match = SEP_URL_REGEX.matchEntire(audioUrl)
@@ -493,6 +496,14 @@ private suspend fun resolveStemUrlToFile(
             errorCode = "invalid_stem_url",
             detail = "stem not found: $stemId",
         )
+    // 콜드/타 인스턴스라 로컬 산출물이 없으면 R2 에서 materialize — 비디오 입력(assetCache)과 동일한
+    // 폴백. eager upload 로 stem 은 R2 에 durable 하다(Application: READY 직전 eager upload). R2
+    // 미설정(objectStore=null)이거나 R2 에도 없으면(다운로드 throw→swallow) 아래 exists 재확인에서
+    // invalid_stem_url 로 reject. downloadIfAbsent 는 blocking S3 I/O 라 IO 디스패처로.
+    if (!stem.file.exists() && objectStore != null) {
+        val key = ObjectKey.separationStem(jobId, stemId, stem.file.extension)
+        runCatching { withContext(Dispatchers.IO) { objectStore.downloadIfAbsent(key, stem.file) } }
+    }
     if (!stem.file.exists()) {
         throw ApiErrorException(
             HttpStatusCode.BadRequest,
