@@ -60,11 +60,11 @@ class AdminRepositoryTest {
         )
     }
 
-    private fun insertSeparationJob(userId: UUID, status: String) = transaction {
+    private fun insertSeparationJob(userId: UUID, status: String, client: String = "mobile") = transaction {
         val id = "sep-" + UUID.randomUUID()
         exec(
-            "INSERT INTO separation_jobs (id, user_id, source_duration_ms, status) " +
-                "VALUES ('$id', CAST('$userId' AS UUID), 1000, '$status')",
+            "INSERT INTO separation_jobs (id, user_id, source_duration_ms, status, client) " +
+                "VALUES ('$id', CAST('$userId' AS UUID), 1000, '$status', '$client')",
         )
     }
 
@@ -105,16 +105,18 @@ class AdminRepositoryTest {
         insertRenderJob(u.id, "COMPLETED")
         insertRenderJob(u.id, "FAILED")
         insertRenderJob(u.id, "PROCESSING")
-        // separation: 성공=READY (COMPLETED 아님!), 진행중은 QUEUED/SUBMITTING/PROCESSING
+        // separation: 성공=READY (COMPLETED 아님!), 진행중은 QUEUED/SUBMITTING/PROCESSING.
+        // 클라이언트별 행 분리 — mobile 4 + plugin 2.
         insertSeparationJob(u.id, "READY")
         insertSeparationJob(u.id, "READY")
-        insertSeparationJob(u.id, "READY")
-        insertSeparationJob(u.id, "FAILED")
+        insertSeparationJob(u.id, "READY", client = "plugin")
+        insertSeparationJob(u.id, "FAILED", client = "plugin")
         insertSeparationJob(u.id, "QUEUED")
         insertSeparationJob(u.id, "PROCESSING")
 
         val rows = admin.getJobStatusBreakdown()
-        assertEquals(listOf("render", "separation"), rows.map { it.jobType })
+        assertEquals(listOf("render", "separation", "separation"), rows.map { it.jobType })
+        assertEquals(listOf(null, "mobile", "plugin"), rows.map { it.client })
 
         val render = rows.first { it.jobType == "render" }
         assertEquals(4, render.total)
@@ -122,23 +124,78 @@ class AdminRepositoryTest {
         assertEquals(1, render.failed)
         assertEquals(1, render.inProgress)
 
-        val sep = rows.first { it.jobType == "separation" }
-        assertEquals(6, sep.total)
-        assertEquals(3, sep.succeeded) // READY 만 성공으로 카운트
-        assertEquals(1, sep.failed)
-        assertEquals(2, sep.inProgress) // QUEUED + PROCESSING
+        val sepMobile = rows.first { it.jobType == "separation" && it.client == "mobile" }
+        assertEquals(4, sepMobile.total)
+        assertEquals(2, sepMobile.succeeded) // READY 만 성공으로 카운트
+        assertEquals(0, sepMobile.failed)
+        assertEquals(2, sepMobile.inProgress) // QUEUED + PROCESSING
+
+        val sepPlugin = rows.first { it.jobType == "separation" && it.client == "plugin" }
+        assertEquals(2, sepPlugin.total)
+        assertEquals(1, sepPlugin.succeeded)
+        assertEquals(1, sepPlugin.failed)
+        assertEquals(0, sepPlugin.inProgress)
     }
 
     @Test
     fun `job status breakdown returns zeroed rows on empty db`() {
         val rows = admin.getJobStatusBreakdown()
-        assertEquals(2, rows.size)
+        assertEquals(3, rows.size) // render + separation(mobile) + separation(plugin)
         rows.forEach {
             assertEquals(0, it.total)
             assertEquals(0, it.succeeded)
             assertEquals(0, it.failed)
             assertEquals(0, it.inProgress)
         }
+    }
+
+    // ── 클라이언트(mobile/plugin) 분리 집계 ─────────────────────────────────
+
+    @Test
+    fun `overview splits separations by client`() {
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        insertSeparationJob(u.id, "READY")
+        insertSeparationJob(u.id, "READY")
+        insertSeparationJob(u.id, "READY", client = "plugin")
+
+        val o = admin.getOverview()
+        assertEquals(3, o.totalSeparations)
+        assertEquals(2, o.mobileSeparations)
+        assertEquals(1, o.pluginSeparations)
+    }
+
+    // getDailyStats 는 generate_series 사용으로 Postgres 전용 — H2 테스트 불가.
+    // 클라이언트 분리 집계(SUM CASE WHEN client='plugin')는 breakdown/users 테스트가 동일 패턴 검증.
+
+    @Test
+    fun `users overview splits separation counts and filters by client`() {
+        val mobileUser = users.upsert(AuthProvider.GOOGLE, "g-1", "m@example.com", "Mobile", null)
+        val pluginUser = users.upsert(AuthProvider.GOOGLE, "g-2", "p@example.com", "Plugin", null)
+        val idleUser = users.upsert(AuthProvider.GOOGLE, "g-3", "i@example.com", "Idle", null)
+        insertSeparationJob(mobileUser.id, "READY")
+        insertRenderJob(mobileUser.id, "COMPLETED")
+        insertSeparationJob(pluginUser.id, "READY", client = "plugin")
+        insertSeparationJob(pluginUser.id, "FAILED", client = "plugin")
+
+        // 필터 없음 — 전원 + per-user 분해.
+        val (all, allTotal) = admin.getUsersOverview(50, 0, null)
+        assertEquals(3, allTotal)
+        val m = all.first { it.email == "m@example.com" }
+        assertEquals(1, m.mobileSeparations)
+        assertEquals(0, m.pluginSeparations)
+        val p = all.first { it.email == "p@example.com" }
+        assertEquals(0, p.mobileSeparations)
+        assertEquals(2, p.pluginSeparations)
+
+        // client=plugin — plugin 분리 이력 사용자만.
+        val (pluginRows, pluginTotal) = admin.getUsersOverview(50, 0, null, client = "plugin")
+        assertEquals(1, pluginTotal)
+        assertEquals("p@example.com", pluginRows.single().email)
+
+        // client=mobile — render 또는 mobile 분리 이력 사용자만 (잡 없는 idle 은 제외).
+        val (mobileRows, mobileTotal) = admin.getUsersOverview(50, 0, null, client = "mobile")
+        assertEquals(1, mobileTotal)
+        assertEquals("m@example.com", mobileRows.single().email)
     }
 
     // ── getRevenue ───────────────────────────────────────────────────────────

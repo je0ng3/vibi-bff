@@ -10,6 +10,7 @@ import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.RL_SEPARATE
 import com.vibi.bff.plugins.requireUser
 import com.vibi.bff.plugins.requireUserActiveIfPossible
+import com.vibi.bff.service.AuthService
 import com.vibi.bff.service.UserRepository
 import io.ktor.server.plugins.ratelimit.rateLimit
 import com.vibi.bff.service.CreditCost
@@ -148,6 +149,13 @@ fun Route.separationRoutes(
                     reservedJobId = newJobId
                 }
 
+                // 클라이언트 태깅 — 1차는 JWT client claim (발급 경로가 결정). claim 없는
+                // 구토큰 전환기 동안은 플러그인만 보내는 history 메타로 보정.
+                val client = if (
+                    principal?.client == AuthService.CLIENT_PLUGIN ||
+                    spec.projectId != null || spec.fileName != null || spec.byteLength != null
+                ) AuthService.CLIENT_PLUGIN else AuthService.CLIENT_MOBILE
+
                 val resultJobId = separationService.submit(
                     sourceFile = sourceFile,
                     spec = spec,
@@ -155,6 +163,7 @@ fun Route.separationRoutes(
                     sourceDurationMs = sourceDurationMs,
                     providedJobId = newJobId,
                     isVideoSource = isVideoSource,
+                    client = client,
                 )
                 // submit 성공 후엔 잡 lifecycle 의 owner 가 SeparationService — 실패 시 환불은
                 // onJobFailed hook 이 담당. 파일 ownership 도 transfer — 라우트 catch 는 더 이상

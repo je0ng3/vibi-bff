@@ -5,12 +5,17 @@ import kotlinx.serialization.Serializable
 /**
  * 일별 사용량 집계. `date` 는 UTC 기준 ISO-8601 (YYYY-MM-DD). render/separation 잡 카운트 +
  * 누적 입력 길이 ms — 대시보드의 라인/막대 차트 데이터.
+ *
+ * separation 은 클라이언트별로 분리 ([mobileSeparationCount] + [pluginSeparationCount] =
+ * [separationCount]). render 는 모바일 전용이라 분리 없음.
  */
 @Serializable
 data class AdminDailyStats(
     val date: String,
     val renderCount: Long,
     val separationCount: Long,
+    val mobileSeparationCount: Long = 0,
+    val pluginSeparationCount: Long = 0,
     val totalSourceDurationMs: Long,
 )
 
@@ -19,6 +24,7 @@ data class AdminDailyStats(
  *
  * - [totalRenders] / [totalSeparations] — 잡 status 와 무관한 시도 횟수 (FAILED 포함).
  *   대시보드는 "사용 시도" 가 핵심이라 성공만 카운트하지 않는다.
+ * - [mobileSeparations] / [pluginSeparations] — 분리 잡의 클라이언트별 분해 (합 = totalSeparations).
  * - [totalSourceDurationMs] — 사용자가 올린 입력 영상의 누적 분량 ms (render_jobs 만).
  * - [lastActivityAt] — 가장 최근 잡 (render or separation) 의 created_at, 둘 다 없으면 가입 시각.
  */
@@ -30,6 +36,8 @@ data class AdminUserOverview(
     val role: String,
     val totalRenders: Long,
     val totalSeparations: Long,
+    val mobileSeparations: Long = 0,
+    val pluginSeparations: Long = 0,
     val totalSourceDurationMs: Long,
     val lastActivityAt: String,
 )
@@ -61,12 +69,15 @@ data class AdminUserJobsResponse(
 
 /**
  * 대시보드 상단 KPI 카드. 전체 누적 + 최근 7일 비교 같은 단일 숫자 시리즈.
+ * separation 은 클라이언트별 분해 포함 (mobile + plugin = total). render 는 모바일 전용.
  */
 @Serializable
 data class AdminOverview(
     val totalUsers: Long,
     val totalRenders: Long,
     val totalSeparations: Long,
+    val mobileSeparations: Long = 0,
+    val pluginSeparations: Long = 0,
     val totalSourceDurationMs: Long,
     val activeUsersLast7Days: Long,
 )
@@ -112,6 +123,8 @@ data class AdminActiveJob(
     val userEmail: String,
     val sourceDurationMs: Long,
     val createdAt: String,
+    // 제출 클라이언트 — separation 은 'mobile'/'plugin', render 는 모바일 전용이라 'mobile' 고정.
+    val client: String = "mobile",
 )
 
 /**
@@ -174,11 +187,13 @@ data class AdminRevenueDaily(
  * 기준으로 프론트에서 계산 — in-progress 가 분모를 흐리지 않도록.
  *
  * - [jobType] — 'render' / 'separation'
+ * - [client] — separation 은 'mobile'/'plugin' 행으로 분리, render 는 null (모바일 전용).
  * - [total] — succeeded + failed + inProgress (전체 시도)
  */
 @Serializable
 data class AdminJobStatusBreakdown(
     val jobType: String,
+    val client: String? = null,
     val total: Long,
     val succeeded: Long,
     val failed: Long,

@@ -21,7 +21,8 @@ export default function DailyChart({ data }: { data: AdminDailyStats[] }) {
   const rows = data.map((d) => ({
     date: d.date.slice(5),
     renders: d.renderCount,
-    separations: d.separationCount,
+    mobileSeparations: d.mobileSeparationCount,
+    pluginSeparations: d.pluginSeparationCount,
   }));
   return (
     <div className="h-72 w-full">
@@ -40,7 +41,9 @@ export default function DailyChart({ data }: { data: AdminDailyStats[] }) {
           />
           <Legend wrapperStyle={{ fontSize: 12 }} />
           <Bar dataKey="renders" name="Renders" fill="#3b82f6" />
-          <Bar dataKey="separations" name="Separations" fill="#10b981" />
+          {/* separation 은 모바일+플러그인 스택 — 합이 기존 Separations 총량과 동일. */}
+          <Bar dataKey="mobileSeparations" name="Separations (mobile)" stackId="sep" fill="#10b981" />
+          <Bar dataKey="pluginSeparations" name="Separations (plugin)" stackId="sep" fill="#8b5cf6" />
         </BarChart>
       </ResponsiveContainer>
     </div>

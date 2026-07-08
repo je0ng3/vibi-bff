@@ -214,6 +214,8 @@ class SeparationService(
         renderJobId: String? = null,
         providedJobId: String? = null,
         isVideoSource: Boolean = false,
+        /** 제출 클라이언트 'mobile' | 'plugin' — admin 집계용, 라우트가 JWT claim 에서 결정. */
+        client: String = AuthService.CLIENT_MOBILE,
     ): String {
         val jobId = providedJobId ?: "sep-${UUID.randomUUID()}"
         val outputDir = File(separationDir, jobId).apply { mkdirs() }
@@ -243,6 +245,7 @@ class SeparationService(
                         projectId = spec.projectId,
                         fileName = spec.fileName,
                         byteLength = spec.byteLength,
+                        client = client,
                     )
                 }.onFailure { e ->
                     // enqueue 실패면 dispatcher 가 영원히 모름 → in-memory 도 FAILED 마킹.

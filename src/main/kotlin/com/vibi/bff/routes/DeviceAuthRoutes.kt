@@ -89,7 +89,8 @@ fun Route.deviceAuthRoutes(
                         if (user == null) {
                             call.respond(DevicePollPendingResponse())
                         } else {
-                            val issued = authService.issueAccessToken(user)
+                            // device-code 는 UXP 패널 전용 로그인 경로 — client=plugin 으로 태깅.
+                            val issued = authService.issueAccessToken(user, AuthService.CLIENT_PLUGIN)
                             // single-use: 발급 후 코드 소비 — 유출된 deviceCode 재폴링으로 추가 토큰 못 찍게.
                             withContext(Dispatchers.IO) { deviceCodes.delete(deviceCode) }
                             call.respond(

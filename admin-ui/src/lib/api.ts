@@ -60,6 +60,8 @@ export interface AdminOverview {
   totalUsers: number;
   totalRenders: number;
   totalSeparations: number;
+  mobileSeparations: number;
+  pluginSeparations: number;
   totalSourceDurationMs: number;
   activeUsersLast7Days: number;
 }
@@ -68,6 +70,8 @@ export interface AdminDailyStats {
   date: string;
   renderCount: number;
   separationCount: number;
+  mobileSeparationCount: number;
+  pluginSeparationCount: number;
   totalSourceDurationMs: number;
 }
 
@@ -78,6 +82,8 @@ export interface AdminUserOverview {
   role: string;
   totalRenders: number;
   totalSeparations: number;
+  mobileSeparations: number;
+  pluginSeparations: number;
   totalSourceDurationMs: number;
   lastActivityAt: string;
 }
@@ -121,6 +127,8 @@ export interface AdminActiveJob {
   userEmail: string;
   sourceDurationMs: number;
   createdAt: string;
+  /** 제출 클라이언트 — separation 은 'mobile'/'plugin', render 는 항상 'mobile'. */
+  client: string;
 }
 
 export interface AdminSignupDaily {
@@ -151,6 +159,8 @@ export interface AdminRevenueDaily {
 
 export interface AdminJobStatusBreakdown {
   jobType: string;
+  /** separation 행은 'mobile'/'plugin' 으로 분리, render 행은 null (모바일 전용). */
+  client: string | null;
   total: number;
   succeeded: number;
   failed: number;

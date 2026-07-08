@@ -10,6 +10,8 @@ export default function UsersPage() {
   const [params, setParams] = useSearchParams();
   const offset = Math.max(0, Number.parseInt(params.get("offset") ?? "0", 10) || 0);
   const queryFromUrl = params.get("q") ?? "";
+  // 클라이언트 필터 — 잡 이력 기준 (mobile: render 또는 mobile 분리, plugin: plugin 분리).
+  const clientFilter = params.get("client") ?? "";
 
   // 검색 input — 사용자가 타이핑 중인 raw 값. URL/요청에는 debounce 적용.
   const [queryDraft, setQueryDraft] = useState(queryFromUrl);
@@ -35,6 +37,7 @@ export default function UsersPage() {
       try {
         const qs = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
         if (queryFromUrl) qs.set("q", queryFromUrl);
+        if (clientFilter) qs.set("client", clientFilter);
         const res = await adminFetch<AdminUsersResponse>(`/api/v2/admin/users?${qs.toString()}`);
         if (!cancelled) setData(res);
       } catch (e) {
@@ -44,7 +47,7 @@ export default function UsersPage() {
       }
     })();
     return () => { cancelled = true; };
-  }, [offset, queryFromUrl, navigate]);
+  }, [offset, queryFromUrl, clientFilter, navigate]);
 
   if (error) return <p className="text-sm text-rose-600">{error}</p>;
   if (!data) return <p className="text-sm text-neutral-500">불러오는 중…</p>;
@@ -64,7 +67,7 @@ export default function UsersPage() {
         <span className="text-sm text-neutral-500">총 {data.total.toLocaleString()}명</span>
       </header>
 
-      <div>
+      <div className="flex flex-wrap items-center gap-3">
         <input
           type="search"
           value={queryDraft}
@@ -72,6 +75,21 @@ export default function UsersPage() {
           placeholder="이메일 또는 이름으로 검색…"
           className="w-full max-w-md rounded border border-neutral-300 bg-white px-3 py-2 text-sm placeholder:text-neutral-400 focus:border-blue-500 focus:outline-none"
         />
+        <select
+          value={clientFilter}
+          onChange={(e) => {
+            const next = new URLSearchParams(params);
+            if (e.target.value) next.set("client", e.target.value);
+            else next.delete("client");
+            next.delete("offset");
+            setParams(next, { replace: true });
+          }}
+          className="rounded border border-neutral-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+        >
+          <option value="">전체 클라이언트</option>
+          <option value="mobile">모바일 앱</option>
+          <option value="plugin">Adobe 플러그인</option>
+        </select>
       </div>
 
       {data.users.length === 0 ? (
@@ -86,7 +104,8 @@ export default function UsersPage() {
                 <th className="px-4 py-3">User</th>
                 <th className="px-4 py-3">Role</th>
                 <th className="px-4 py-3 text-right">Renders</th>
-                <th className="px-4 py-3 text-right">Separations</th>
+                <th className="px-4 py-3 text-right">Sep (mobile)</th>
+                <th className="px-4 py-3 text-right">Sep (plugin)</th>
                 <th className="px-4 py-3 text-right">Uploaded</th>
                 <th className="px-4 py-3">Last activity</th>
               </tr>
@@ -112,7 +131,8 @@ export default function UsersPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums">{u.totalRenders.toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums">{u.totalSeparations.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right tabular-nums">{u.mobileSeparations.toLocaleString()}</td>
+                  <td className="px-4 py-3 text-right tabular-nums">{u.pluginSeparations.toLocaleString()}</td>
                   <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(u.totalSourceDurationMs)}</td>
                   <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(u.lastActivityAt)}</td>
                 </tr>

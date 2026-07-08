@@ -1,5 +1,6 @@
 import type { AdminActiveJob } from "../lib/api";
 import { formatDurationMs, formatIsoDateTime } from "../lib/format";
+import ClientBadge from "./ClientBadge";
 
 /**
  * status='PROCESSING' 잡 목록. 가장 오래된 것 먼저 — stuck 의심 신호.
@@ -32,6 +33,7 @@ export default function ActiveJobsTable({ rows }: { rows: AdminActiveJob[] }) {
                 <span className="rounded bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-700">
                   {j.jobType}
                 </span>
+                {j.jobType === "separation" && <ClientBadge client={j.client} />}
               </td>
               <td className="px-4 py-3 font-mono text-xs">{j.jobId}</td>
               <td className="px-4 py-3 text-neutral-600">{j.userEmail}</td>

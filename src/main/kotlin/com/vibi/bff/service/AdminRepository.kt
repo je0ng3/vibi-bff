@@ -50,23 +50,26 @@ class AdminRepository {
      * 날짜 단위는 UTC. 빈 날짜는 결과에 포함되지 않음 — 호출자가 필요하면 채워서 표시.
      */
     fun getDailyStats(fromInclusive: Instant, toExclusive: Instant): List<AdminDailyStats> = transaction {
+        // 별칭은 'bucket_date' — 'day' 는 H2(PostgreSQL mode) 예약어 (getRevenueDaily 와 동일).
         val sql = """
             SELECT
-                d::date AS day,
+                d::date AS bucket_date,
                 COALESCE(r.cnt, 0) AS render_count,
                 COALESCE(r.dur, 0) AS render_duration,
-                COALESCE(s.cnt, 0) AS separation_count
+                COALESCE(s.cnt, 0) AS separation_count,
+                COALESCE(s.plugin_cnt, 0) AS separation_plugin_count
             FROM (
                 SELECT generate_series(?::timestamp::date, (?::timestamp - INTERVAL '1 day')::date, INTERVAL '1 day') AS d
             ) days
             LEFT JOIN (
-                SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS cnt, SUM(source_duration_ms) AS dur
+                SELECT date_trunc('day', created_at)::date AS bucket_date, COUNT(*) AS cnt, SUM(source_duration_ms) AS dur
                 FROM render_jobs WHERE created_at >= ? AND created_at < ? GROUP BY 1
-            ) r ON r.day = d::date
+            ) r ON r.bucket_date = d::date
             LEFT JOIN (
-                SELECT date_trunc('day', created_at)::date AS day, COUNT(*) AS cnt
+                SELECT date_trunc('day', created_at)::date AS bucket_date, COUNT(*) AS cnt,
+                       SUM(CASE WHEN client = 'plugin' THEN 1 ELSE 0 END) AS plugin_cnt
                 FROM separation_jobs WHERE created_at >= ? AND created_at < ? GROUP BY 1
-            ) s ON s.day = d::date
+            ) s ON s.bucket_date = d::date
             ORDER BY d::date
         """.trimIndent()
         val results = mutableListOf<AdminDailyStats>()
@@ -76,11 +79,15 @@ class AdminRepository {
             instantArg(fromInclusive), instantArg(toExclusive),
         )) { rs ->
             while (rs.next()) {
-                val day = rs.getDate("day").toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE)
+                val day = rs.getDate("bucket_date").toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE)
+                val sepTotal = rs.getLong("separation_count")
+                val sepPlugin = rs.getLong("separation_plugin_count")
                 results += AdminDailyStats(
                     date = day,
                     renderCount = rs.getLong("render_count"),
-                    separationCount = rs.getLong("separation_count"),
+                    separationCount = sepTotal,
+                    mobileSeparationCount = sepTotal - sepPlugin,
+                    pluginSeparationCount = sepPlugin,
                     totalSourceDurationMs = rs.getLong("render_duration"),
                 )
             }
@@ -93,18 +100,51 @@ class AdminRepository {
      * total 은 같은 트랜잭션에서 count(*) — 페이지 사이 가입자 유입 차이는 v1 무시.
      *
      * [query] non-blank 면 email/name 부분일치 검색 (대소문자 무시). 인터뷰/지원 대응 시 자주 필요.
+     *
+     * [client] 는 'mobile' | 'plugin' | null. 잡 이력 기준 필터 — 'plugin' 은 plugin 분리 잡
+     * 1건 이상, 'mobile' 은 render 또는 mobile 분리 잡 1건 이상인 사용자만. 잡이 아예 없는
+     * 가입-only 사용자는 어느 필터에도 안 잡힌다 (전체 보기에서만 노출).
      */
-    fun getUsersOverview(limit: Int, offset: Int, query: String?): Pair<List<AdminUserOverview>, Long> = transaction {
+    fun getUsersOverview(
+        limit: Int,
+        offset: Int,
+        query: String?,
+        client: String? = null,
+    ): Pair<List<AdminUserOverview>, Long> = transaction {
         require(limit in 1..200) { "limit must be in 1..200 (got $limit)" }
         require(offset >= 0) { "offset must be >= 0 (got $offset)" }
+        require(client == null || client == "mobile" || client == "plugin") {
+            "client must be 'mobile' or 'plugin' (got $client)"
+        }
 
         val q = query?.trim()?.takeIf { it.isNotEmpty() }
         val likePattern = q?.let { "%${it.lowercase().replace("%", "\\%")}%" }
-        val whereClause = if (q != null) "WHERE LOWER(u.email) LIKE ? OR LOWER(u.name) LIKE ?" else ""
+        val conditions = mutableListOf<String>()
+        if (q != null) conditions += "(LOWER(u.email) LIKE ? OR LOWER(u.name) LIKE ?)"
+        when (client) {
+            "plugin" -> conditions += "COALESCE(s.plugin_cnt, 0) > 0"
+            "mobile" -> conditions += "(COALESCE(r.cnt, 0) > 0 OR COALESCE(s.cnt, 0) - COALESCE(s.plugin_cnt, 0) > 0)"
+        }
+        val whereClause = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
         val whereArgs: List<Pair<IColumnType<*>, Any?>> =
             if (likePattern != null) listOf(textArg(likePattern), textArg(likePattern)) else emptyList()
 
-        val total: Long = scalarLong("SELECT COUNT(*) FROM users u $whereClause", whereArgs)
+        // client 필터가 잡 aggregate 를 참조하므로 count 도 동일 join 위에서 계산.
+        val fromClause = """
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) AS cnt, SUM(source_duration_ms) AS dur, MAX(created_at) AS last_at
+                FROM render_jobs GROUP BY user_id
+            ) r ON r.user_id = u.id
+            LEFT JOIN (
+                SELECT user_id, COUNT(*) AS cnt,
+                       SUM(CASE WHEN client = 'plugin' THEN 1 ELSE 0 END) AS plugin_cnt,
+                       MAX(created_at) AS last_at
+                FROM separation_jobs GROUP BY user_id
+            ) s ON s.user_id = u.id
+        """.trimIndent()
+
+        val total: Long = scalarLong("SELECT COUNT(*) $fromClause $whereClause", whereArgs)
 
         val rows = mutableListOf<AdminUserOverview>()
         val sql = """
@@ -114,16 +154,9 @@ class AdminRepository {
                 COALESCE(r.dur, 0) AS render_duration,
                 COALESCE(r.last_at, NULL) AS render_last,
                 COALESCE(s.cnt, 0) AS sep_count,
+                COALESCE(s.plugin_cnt, 0) AS sep_plugin_count,
                 COALESCE(s.last_at, NULL) AS sep_last
-            FROM users u
-            LEFT JOIN (
-                SELECT user_id, COUNT(*) AS cnt, SUM(source_duration_ms) AS dur, MAX(created_at) AS last_at
-                FROM render_jobs GROUP BY user_id
-            ) r ON r.user_id = u.id
-            LEFT JOIN (
-                SELECT user_id, COUNT(*) AS cnt, MAX(created_at) AS last_at
-                FROM separation_jobs GROUP BY user_id
-            ) s ON s.user_id = u.id
+            $fromClause
             $whereClause
             ORDER BY GREATEST(
                 COALESCE(r.last_at, u.created_at),
@@ -132,10 +165,7 @@ class AdminRepository {
             LIMIT ? OFFSET ?
         """.trimIndent()
         val args = mutableListOf<Pair<IColumnType<*>, Any?>>()
-        if (likePattern != null) {
-            args.add(textArg(likePattern))
-            args.add(textArg(likePattern))
-        }
+        args.addAll(whereArgs)
         args.add(intArg(limit))
         args.add(intArg(offset))
         TransactionManager.current().exec(sql, args = args) { rs ->
@@ -144,13 +174,17 @@ class AdminRepository {
                 val sepLast = rs.getTimestamp("sep_last")?.toInstant()
                 val created = rs.getTimestamp("created_at").toInstant()
                 val lastActivity = listOfNotNull(renderLast, sepLast).maxOrNull() ?: created
+                val sepCount = rs.getLong("sep_count")
+                val sepPlugin = rs.getLong("sep_plugin_count")
                 rows += AdminUserOverview(
                     userId = (rs.getObject("id") as UUID).toString(),
                     email = rs.getString("email"),
                     name = rs.getString("name"),
                     role = rs.getString("role"),
                     totalRenders = rs.getLong("render_count"),
-                    totalSeparations = rs.getLong("sep_count"),
+                    totalSeparations = sepCount,
+                    mobileSeparations = sepCount - sepPlugin,
+                    pluginSeparations = sepPlugin,
                     totalSourceDurationMs = rs.getLong("render_duration"),
                     lastActivityAt = DateTimeFormatter.ISO_INSTANT.format(lastActivity),
                 )
@@ -235,12 +269,14 @@ class AdminRepository {
      */
     fun getActiveJobs(): List<AdminActiveJob> = transaction {
         val sql = """
-            SELECT job_type, job_id, email, source_duration_ms, created_at FROM (
-                SELECT 'render' AS job_type, r.id AS job_id, u.email, r.source_duration_ms, r.created_at
+            SELECT job_type, job_id, email, source_duration_ms, created_at, client FROM (
+                SELECT 'render' AS job_type, r.id AS job_id, u.email, r.source_duration_ms, r.created_at,
+                       'mobile' AS client
                 FROM render_jobs r JOIN users u ON u.id = r.user_id
                 WHERE r.status = 'PROCESSING'
                 UNION ALL
-                SELECT 'separation' AS job_type, s.id AS job_id, u.email, s.source_duration_ms, s.created_at
+                SELECT 'separation' AS job_type, s.id AS job_id, u.email, s.source_duration_ms, s.created_at,
+                       s.client
                 FROM separation_jobs s JOIN users u ON u.id = s.user_id
                 WHERE s.status = 'PROCESSING'
             ) t
@@ -256,6 +292,7 @@ class AdminRepository {
                     userEmail = rs.getString("email"),
                     sourceDurationMs = rs.getLong("source_duration_ms"),
                     createdAt = DateTimeFormatter.ISO_INSTANT.format(rs.getTimestamp("created_at").toInstant()),
+                    client = rs.getString("client"),
                 )
             }
         }
@@ -414,20 +451,28 @@ class AdminRepository {
     /**
      * render/separation 잡의 성공/실패/진행중 분해. 성공 status 가 종류별로 다름:
      * render=COMPLETED, separation=READY. 실패는 둘 다 FAILED, 나머지는 inProgress.
+     * separation 은 클라이언트('mobile'/'plugin') 행으로 분리 — render 는 모바일 전용이라 단일 행.
      */
     fun getJobStatusBreakdown(): List<AdminJobStatusBreakdown> = transaction {
-        fun breakdown(table: String, successStatus: String): AdminJobStatusBreakdown {
+        fun breakdown(
+            table: String,
+            successStatus: String,
+            client: String? = null,
+        ): AdminJobStatusBreakdown {
+            val clientFilter = if (client != null) "WHERE client = ?" else ""
             val sql = """
                 SELECT
                     COUNT(*) AS total,
                     SUM(CASE WHEN status = '$successStatus' THEN 1 ELSE 0 END) AS succeeded,
                     SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed
                 FROM $table
+                $clientFilter
             """.trimIndent()
+            val args = if (client != null) listOf(textArg(client)) else emptyList()
             var total = 0L
             var succeeded = 0L
             var failed = 0L
-            TransactionManager.current().exec(sql) { rs ->
+            TransactionManager.current().exec(sql, args = args) { rs ->
                 if (rs.next()) {
                     total = rs.getLong("total")
                     succeeded = rs.getLong("succeeded")
@@ -436,6 +481,7 @@ class AdminRepository {
             }
             return AdminJobStatusBreakdown(
                 jobType = if (table == "render_jobs") "render" else "separation",
+                client = client,
                 total = total,
                 succeeded = succeeded,
                 failed = failed,
@@ -445,7 +491,8 @@ class AdminRepository {
         // 잡 종류 식별자는 'render'/'separation' 고정 — 테이블명에서 파생.
         listOf(
             breakdown("render_jobs", "COMPLETED"),
-            breakdown("separation_jobs", "READY"),
+            breakdown("separation_jobs", "READY", client = "mobile"),
+            breakdown("separation_jobs", "READY", client = "plugin"),
         )
     }
 
@@ -454,10 +501,14 @@ class AdminRepository {
      */
     fun getOverview(): AdminOverview = transaction {
         val sevenDaysAgo = Instant.now().minusSeconds(7 * 24 * 3600)
+        val totalSeparations = scalarLong("SELECT COUNT(*) FROM separation_jobs")
+        val pluginSeparations = scalarLong("SELECT COUNT(*) FROM separation_jobs WHERE client = 'plugin'")
         AdminOverview(
             totalUsers = scalarLong("SELECT COUNT(*) FROM users"),
             totalRenders = scalarLong("SELECT COUNT(*) FROM render_jobs"),
-            totalSeparations = scalarLong("SELECT COUNT(*) FROM separation_jobs"),
+            totalSeparations = totalSeparations,
+            mobileSeparations = totalSeparations - pluginSeparations,
+            pluginSeparations = pluginSeparations,
             totalSourceDurationMs = scalarLong("SELECT COALESCE(SUM(source_duration_ms), 0) FROM render_jobs"),
             activeUsersLast7Days = scalarLong(
                 """

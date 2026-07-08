@@ -1,4 +1,5 @@
 import type { AdminJobStatusBreakdown } from "../lib/api";
+import ClientBadge from "./ClientBadge";
 
 /**
  * 잡 성공/실패 분해 — render/separation 각 행. 성공률은 terminal(succeeded+failed) 기준으로
@@ -39,11 +40,12 @@ export default function JobStatusTable({ rows }: { rows: AdminJobStatusBreakdown
                     ? "text-amber-700"
                     : "text-emerald-700";
             return (
-              <tr key={r.jobType} className="hover:bg-neutral-50">
+              <tr key={`${r.jobType}-${r.client ?? "all"}`} className="hover:bg-neutral-50">
                 <td className="px-4 py-3">
                   <span className="rounded bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-700">
                     {r.jobType}
                   </span>
+                  {r.client && <ClientBadge client={r.client} />}
                 </td>
                 <td className="px-4 py-3 text-right tabular-nums">{r.total.toLocaleString()}</td>
                 <td className="px-4 py-3 text-right tabular-nums text-neutral-700">{r.succeeded.toLocaleString()}</td>

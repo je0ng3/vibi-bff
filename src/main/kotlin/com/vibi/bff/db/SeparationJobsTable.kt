@@ -43,5 +43,9 @@ object SeparationJobsTable : Table("separation_jobs") {
     val fileName = text("file_name").nullable()
     val byteLength = long("byte_length").nullable()
 
+    // V14: 제출 클라이언트 'mobile' | 'plugin' — admin 대시보드의 클라이언트별 분리 집계용.
+    // JWT client claim 기반 (AuthService.CLIENT_*), 구토큰 전환기는 plugin history 메타로 보정.
+    val client = text("client").default("mobile")
+
     override val primaryKey = PrimaryKey(id)
 }
