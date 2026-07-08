@@ -811,7 +811,12 @@ components:
       type: object
       required: [stemId, label, url]
       properties:
-        stemId: { type: string }
+        stemId:
+          type: string
+          description: |
+            speaker_N (화자별, 0-based) / voice_all (전체 화자 mix, 화자 2명+) /
+            background (순수 BGM, 리액션 제외) / background_reaction (리액션 포함 배경음).
+            background 2종은 각각 best-effort — 누락 시 해당 stem 미포함.
         label: { type: string }
         url:
           type: string
