@@ -14,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -45,6 +46,12 @@ import java.util.concurrent.TimeUnit
 
 /** speaker stem id = "$SPEAKER_STEM_PREFIX$idx" (idx 0-based). 모바일 Stem.SPEAKER_PREFIX 와 일치. */
 internal const val SPEAKER_STEM_PREFIX = "speaker_"
+
+/** 순수 BGM (리액션 제외) — OriginalBaseBackground. 클라이언트는 stemId 로 라벨 매핑. */
+internal const val BACKGROUND_STEM_ID = "background"
+
+/** 리액션(효과음·추임새·비주 화자) 포함 배경음 — OriginalSubBackground. base 와 함께 노출해 사용자가 택일. */
+internal const val BACKGROUND_REACTION_STEM_ID = "background_reaction"
 
 data class SeparationJob(
     val jobId: String,
@@ -485,7 +492,14 @@ class SeparationService(
         }
 
         job.progressReason = "Fetching background"
-        val backgroundFile = downloadBackgroundStem(projectSeq, job.outputDir, readyInfo)
+        // 순수 BGM(base) 과 리액션 포함(sub) 배경음은 서로 독립 다운로드 — 각각 404 backoff 로 최대
+        // 수십초 재시도할 수 있어 순차 실행 시 지연이 직렬로 쌓인다. 병렬로 받아 wall-clock 단축.
+        // 둘 다 best-effort (실패 시 null 반환, throw 없음) 라 한쪽 실패가 다른 쪽을 취소하지 않는다.
+        val (backgroundFile, reactionBackgroundFile) = coroutineScope {
+            val base = async { downloadBackgroundStem(projectSeq, job.outputDir, readyInfo) }
+            val reaction = async { downloadReactionBackgroundStem(projectSeq, job.outputDir, readyInfo) }
+            base.await() to reaction.await()
+        }
 
         // Perso 가 내려주는 stem 은 PCM wav (비압축) — egress 비용의 큰 부분. FLAC 으로 transcode
         // 해 lossless 유지하면서 ~50% 절감. 모바일 (Android MediaPlayer / iOS AVAudioFile) 모두
@@ -507,12 +521,23 @@ class SeparationService(
             local.add(0, LocalStem("voice_all", "모든 화자", voiceAllFile))
         }
 
+        // 배경음 2종 — 순수 BGM(리액션 제외) + 리액션 포함. 각각 독립 stem 으로 노출해 클라이언트가
+        // 택일(또는 둘 다 mix)한다. 라벨은 클라이언트가 stemId 로 매핑하지만, stemId 매핑이 없는
+        // generic 소비자(모바일 label 폴백)를 위해 서버 라벨도 영어로 의미를 담는다.
         backgroundFile?.let { wav ->
-            val flacBg = File(job.outputDir, "background.flac")
+            val flacBg = File(job.outputDir, "$BACKGROUND_STEM_ID.flac")
             transcodeToFlac(wav, flacBg)
             wav.delete()
-            local.add(LocalStem("background", "배경음", flacBg))
+            local.add(LocalStem(BACKGROUND_STEM_ID, "Background (no reaction)", flacBg))
             log.info("Background stem ready: file={} size={}B", flacBg.name, flacBg.length())
+        }
+
+        reactionBackgroundFile?.let { wav ->
+            val flacBg = File(job.outputDir, "$BACKGROUND_REACTION_STEM_ID.flac")
+            transcodeToFlac(wav, flacBg)
+            wav.delete()
+            local.add(LocalStem(BACKGROUND_REACTION_STEM_ID, "Background (with reaction)", flacBg))
+            log.info("Reaction background stem ready: file={} size={}B", flacBg.name, flacBg.length())
         }
 
         // speaker stem 들은 모두 같은 trim 입력에서 분리돼 동일 길이라 1개만 측정.
@@ -655,11 +680,13 @@ class SeparationService(
     }
 
     // ── Background (.wav) 다운로드 ──────────────────────────────────────────
-    // 정책 (사용자 피드백): 화자 수와 무관하게 항상 **순수 BGM** 만 노출. originalBackgroundPath
-    // (OriginalBaseBackground) 만 사용 — Perso 가 화자 수 무관하게 분리해 주는 진짜 BGM only.
-    // 과거 1명 화자에서 SubBackground 로 폴백하던 path 는 풀믹스(리액션 포함) 가 섞여 들어와
-    // "순수 배경음" 약속을 깨므로 영구 제거. 진짜 BGM 이 누락된 케이스는 stem 자체를 누락시키는
-    // 쪽이 안전 — 클라이언트 UI 는 background stem 부재를 graceful 하게 처리한다.
+    // 배경음을 2종 노출한다 — 사용자가 렌더 시 택일(또는 둘 다 mix)한다.
+    //   • 순수 BGM (리액션 제외): originalBackgroundPath (OriginalBaseBackground). Perso 가 화자 수
+    //     무관하게 분리해 주는 진짜 BGM only. → stemId=background
+    //   • 리액션 포함 배경음: originalSubBackgroundPath (OriginalSubBackground). 효과음·추임새·비주
+    //     화자가 섞인 배경음. 화자 1명 케이스에선 풀믹스에 가깝다는 점 유의. → stemId=background_reaction
+    // 둘 다 best-effort — path 누락/다운로드 실패 시 해당 stem 만 skip. 클라이언트 UI 는 background
+    // stem 부재를 graceful 하게 처리한다.
     private suspend fun downloadBackgroundStem(
         projectSeq: Long,
         outputDir: File,
@@ -671,7 +698,7 @@ class SeparationService(
             return null
         }
         return try {
-            val wavFile = File(outputDir, "background.wav")
+            val wavFile = File(outputDir, "$BACKGROUND_STEM_ID.wav")
             downloadFreshLinkWithRetry(
                 label = "background base wav (project $projectSeq)",
                 target = wavFile,
@@ -680,6 +707,35 @@ class SeparationService(
             wavFile
         } catch (e: Exception) {
             log.warn("Failed to download background stem (project {}): {}", projectSeq, e.message)
+            null
+        }
+    }
+
+    /**
+     * 리액션 포함 배경음 (OriginalSubBackground) 다운로드 — [downloadBackgroundStem] 의 sibling.
+     * originalSubBackgroundPath 는 효과음·추임새·비주 화자가 섞인 배경음. 순수 BGM 과 함께 노출해
+     * 사용자가 택일한다. base 와 동일하게 best-effort — path 누락/실패 시 null 반환하고 stem 만 skip.
+     */
+    private suspend fun downloadReactionBackgroundStem(
+        projectSeq: Long,
+        outputDir: File,
+        projectInfo: PersoProjectInfo,
+    ): File? {
+        val subBgPath = projectInfo.downloadPathInfo?.originalSubBackgroundPath
+        if (subBgPath == null) {
+            log.warn("originalSubBackgroundPath absent — no reaction background stem emitted (project {})", projectSeq)
+            return null
+        }
+        return try {
+            val wavFile = File(outputDir, "$BACKGROUND_REACTION_STEM_ID.wav")
+            downloadFreshLinkWithRetry(
+                label = "background sub (reaction) wav (project $projectSeq)",
+                target = wavFile,
+            ) { subBgPath }
+            log.info("Downloaded background (Sub/reaction) wav: projectSeq={} size={}B", projectSeq, wavFile.length())
+            wavFile
+        } catch (e: Exception) {
+            log.warn("Failed to download reaction background stem (project {}): {}", projectSeq, e.message)
             null
         }
     }

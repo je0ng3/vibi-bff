@@ -73,13 +73,11 @@ GET    /api/v2/testdata/separation/*      # (dev mock)
 
 **해결 패턴**: `PersoConfig.storageBaseUrl = https://portal-media.perso.ai` 환경 변수 분리. `PersoClient.streamDownloadAuthorized` 가 path 가 `/perso-storage/...` 시작이면 storage host + 인증 헤더 X 로 분기. `getDownloadLinks` 의 path 매번 새로 받아도 cache key 는 동일 — 매 retry 마다 fresh path 받아 새 cache key 로 storage 직접 조회. SSRF 차단을 위해 host 화이트리스트(`PERSO_DOWNLOAD_ALLOWED_HOSTS`) 강제.
 
-### Perso `originalSubBackground` 의미 화자 수에 따라 다름 — `originalBackgroundPath` 우선
+### Perso 배경음 2종 노출 — `background` (순수 BGM) + `background_reaction` (리액션 포함)
 
-**증상**: 화자 1명 영상 분리 시 `target=originalSubBackground` 결과가 화자 + BGM mix 그대로. 화자 2명+ 영상에선 BGM only 처럼 보임.
+**배경**: Perso 의 `OriginalBaseBackground` 는 진짜 BGM only (리액션 제외, `downloadPathInfo.originalBackgroundPath`), `OriginalSubBackground` 는 효과음·추임새·비주 화자가 섞인 배경음 (`downloadPathInfo.originalSubBackgroundPath`). 'Sub' 는 화자 수에 따라 후처리가 달라 화자 1명 케이스에선 풀믹스에 가깝다.
 
-**원인**: Perso 의 `OriginalSubBackground` 의 'Sub' 가 화자 수에 따라 후처리 다름. 진짜 BGM only 는 file 명 `OriginalBaseBackground` (project info endpoint 의 `downloadPathInfo.originalBackgroundPath`).
-
-**해결 패턴**: `SeparationService.downloadBackgroundStem` 이 `getProjectInfo(projectSeq).downloadPathInfo.originalBackgroundPath` 우선 시도, 누락 시 `originalSubBackground` fallback.
+**해결 패턴**: `SeparationService` 가 둘 다 각각 독립 stem 으로 노출한다 — `downloadBackgroundStem` → stemId `background` (라벨 "Background (no reaction)"), `downloadReactionBackgroundStem` → stemId `background_reaction` (라벨 "Background (with reaction)"). 각각 best-effort (path 누락/다운로드 실패 시 해당 stem 만 skip). 클라이언트는 stemId 로 라벨 매핑 후 사용자가 렌더 시 택일(또는 둘 다 mix). 라벨 상수는 `BACKGROUND_STEM_ID` / `BACKGROUND_REACTION_STEM_ID`.
 
 ### Perso audio-separation — 업로드 codec 은 **PCM WAV / MP3**, FLAC 은 거부
 
