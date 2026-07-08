@@ -49,13 +49,18 @@ fun Route.adminRoutes(
         }
 
         // 사용자 목록 — 최근 활동 desc. limit 1..200, offset >= 0.
-        // q non-blank 면 email/name 부분일치 검색.
+        // q non-blank 면 email/name 부분일치 검색. client=mobile|plugin 이면 해당 클라이언트
+        // 사용 이력이 있는 사용자만 (잡 기준 — AdminRepository.getUsersOverview 참조).
         get("/users") {
             call.requireAdmin(jwtSecret)
             val (limit, offset) = call.parsePagination()
             val query = call.request.queryParameters["q"]
+            val client = call.request.queryParameters["client"]?.takeIf { it.isNotBlank() }
+            if (client != null && client != "mobile" && client != "plugin") {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_client")
+            }
             val (rows, total) = withContext(Dispatchers.IO) {
-                adminRepository.getUsersOverview(limit, offset, query)
+                adminRepository.getUsersOverview(limit, offset, query, client)
             }
             call.respond(HttpStatusCode.OK, AdminUsersResponse(users = rows, total = total))
         }

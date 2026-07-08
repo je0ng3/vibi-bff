@@ -13,10 +13,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * 인증된 호출자 정보. [userId] 는 internal UUID (users.id), [role] 은 'user' 또는 'admin'.
+ * 인증된 호출자 정보. [userId] 는 internal UUID (users.id), [role] 은 'user' 또는 'admin',
+ * [client] 는 토큰 발급 경로가 찍은 'mobile' 또는 'plugin' ([AuthService.CLIENT_MOBILE] 참조).
  * JWT claim 에서 직접 파싱 — DB lookup 없음 (핫패스 성능 + admin 승격 즉시 반영은 재로그인 후).
  */
-data class JwtPrincipal(val userId: UUID, val role: String) {
+data class JwtPrincipal(
+    val userId: UUID,
+    val role: String,
+    val client: String = AuthService.CLIENT_MOBILE,
+) {
     val isAdmin: Boolean get() = role == ROLE_ADMIN
 }
 
@@ -56,7 +61,10 @@ fun ApplicationCall.requireUser(jwtSecret: String): JwtPrincipal {
         throw ApiErrorException(HttpStatusCode.Unauthorized, "invalid_token")
     }
     val role = decoded.getClaim("role").asString()?.takeIf { it.isNotBlank() } ?: ROLE_USER
-    return JwtPrincipal(userId = userId, role = role)
+    // client claim 없는 구버전 JWT 는 'mobile' fallback (V14 도입 전 발급분).
+    val client = decoded.getClaim("client").asString()?.takeIf { it.isNotBlank() }
+        ?: AuthService.CLIENT_MOBILE
+    return JwtPrincipal(userId = userId, role = role, client = client)
 }
 
 /**

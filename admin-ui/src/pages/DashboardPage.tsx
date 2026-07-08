@@ -91,7 +91,11 @@ export default function DashboardPage() {
           <StatCard label="Users" value={o.totalUsers.toLocaleString()} />
           <StatCard label="Active (7d)" value={o.activeUsersLast7Days.toLocaleString()} />
           <StatCard label="Renders" value={o.totalRenders.toLocaleString()} />
-          <StatCard label="Separations" value={o.totalSeparations.toLocaleString()} />
+          <StatCard
+            label="Separations"
+            value={o.totalSeparations.toLocaleString()}
+            sub={`모바일 ${o.mobileSeparations.toLocaleString()} · 플러그인 ${o.pluginSeparations.toLocaleString()}`}
+          />
         </div>
         <div className="mt-4">
           <StatCard
@@ -147,7 +151,9 @@ export default function DashboardPage() {
 
       <section>
         <h2 className="text-lg font-semibold">Last 30 days</h2>
-        <p className="mt-1 text-sm text-neutral-500">일별 render / separation 잡 카운트. UTC 기준.</p>
+        <p className="mt-1 text-sm text-neutral-500">
+          일별 render / separation 잡 카운트. separation 은 모바일·플러그인 스택. UTC 기준.
+        </p>
         <div className="mt-4 rounded-lg border border-neutral-200 bg-white p-4">
           <DailyChart data={state.daily} />
         </div>

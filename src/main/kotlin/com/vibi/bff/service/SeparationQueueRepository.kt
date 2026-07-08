@@ -48,6 +48,8 @@ class SeparationQueueRepository {
         projectId: String? = null,
         fileName: String? = null,
         byteLength: Long? = null,
+        // 제출 클라이언트 'mobile' | 'plugin' — admin 대시보드 분리 집계용 (V14).
+        client: String = "mobile",
     ) = newSuspendedTransaction(Dispatchers.IO) {
         val now = Instant.now()
         SeparationJobsTable.insert {
@@ -63,6 +65,7 @@ class SeparationQueueRepository {
             it[SeparationJobsTable.projectId] = projectId
             it[SeparationJobsTable.fileName] = fileName
             it[SeparationJobsTable.byteLength] = byteLength
+            it[SeparationJobsTable.client] = client
         }
         Unit
     }

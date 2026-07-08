@@ -229,7 +229,12 @@ class AuthService(
         )
     }
 
-    fun issueAccessToken(user: AuthUser): AuthResponse {
+    /**
+     * [client] 는 발급 경로가 결정 — 모바일 네이티브 ID Token 교환은 [CLIENT_MOBILE](default),
+     * device-code 로그인(UXP 패널 전용)은 [CLIENT_PLUGIN]. claim 으로 실려 분리 잡 등
+     * 사용량 집계의 클라이언트 태깅에 쓰인다 (plugins/Auth.kt#requireUser 가 파싱).
+     */
+    fun issueAccessToken(user: AuthUser, client: String = CLIENT_MOBILE): AuthResponse {
         val nowMs = clock()
         val expiresAtMs = nowMs + config.jwtExpirySeconds * 1000L
         val token = JWT.create()
@@ -239,6 +244,7 @@ class AuthService(
             .withClaim("email", user.email)
             .withClaim("name", user.name)
             .withClaim("role", user.role)
+            .withClaim("client", client)
             .apply { user.picture?.let { withClaim("picture", it) } }
             .withIssuedAt(Date(nowMs))
             .withExpiresAt(Date(expiresAtMs))
@@ -252,6 +258,9 @@ class AuthService(
         /** 발급 access token 의 aud — secret 재사용(다른 목적/서비스 토큰)에 대한 교차사용 방어.
          *  plugins/Auth.kt#requireUser + plugins/RateLimiting 의 검증과 동기. */
         const val AUDIENCE = "vibi-mobile"
+        /** JWT client claim 값 — 사용량 집계의 클라이언트 태깅. 발급 경로가 결정. */
+        const val CLIENT_MOBILE = "mobile"
+        const val CLIENT_PLUGIN = "plugin"
         private const val APPLE_ISSUER = "https://appleid.apple.com"
         /** Google ID 토큰의 적법 iss 값 (둘 다 허용). */
         private val GOOGLE_ISSUERS = setOf("accounts.google.com", "https://accounts.google.com")
