@@ -179,6 +179,28 @@ export interface AdminAdStats {
   watchingUsers: number;
 }
 
+export interface AdminDeletionStats {
+  totalDeletions: number;
+  deletions30d: number;
+  avgTenureDays: number;
+  medianTenureDays: number;
+}
+
+export interface AdminHealth {
+  windowHours: number;
+  jobsTerminal: number;
+  jobsFailed: number;
+  upstreamCalls: number;
+  upstreamFailures: number;
+  upstreamP95Ms: number;
+}
+
+export interface AdminDeletionDaily {
+  date: string;
+  googleCount: number;
+  appleCount: number;
+}
+
 export interface AdminJobStatusBreakdown {
   jobType: string;
   /** separation 행은 'mobile'/'plugin' 으로 분리, render 행은 null (모바일 전용). */

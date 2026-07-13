@@ -4,8 +4,11 @@ import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
 import com.vibi.bff.model.AdminDailyStats
+import com.vibi.bff.model.AdminDeletionDaily
+import com.vibi.bff.model.AdminDeletionStats
 import com.vibi.bff.model.AdminDurationBucket
 import com.vibi.bff.model.AdminExternalCallDaily
+import com.vibi.bff.model.AdminHealth
 import com.vibi.bff.model.AdminJobStatusBreakdown
 import com.vibi.bff.model.AdminOverview
 import com.vibi.bff.model.AdminSignupDaily
@@ -37,6 +40,17 @@ private fun scalarLong(sql: String, args: List<Pair<IColumnType<*>, Any?>> = emp
     TransactionManager.current().exec(sql, args = args) { rs ->
         rs.next(); rs.getLong(1)
     } ?: 0L
+
+/** 소수 첫째 자리 반올림 — 체류기간(일) 표시용. */
+private fun round1(v: Double): Double = Math.round(v * 10.0) / 10.0
+
+/** 정렬 후 중앙값. 짝수개면 가운데 두 값의 평균. 빈 리스트는 호출측에서 가드. */
+private fun medianOf(values: List<Long>): Double {
+    val sorted = values.sorted()
+    val n = sorted.size
+    val mid = n / 2
+    return if (n % 2 == 1) sorted[mid].toDouble() else (sorted[mid - 1] + sorted[mid]) / 2.0
+}
 
 /**
  * admin 대시보드용 read-only 쿼리. mutating action 없음 (v1 의도적 제외).
@@ -320,6 +334,133 @@ class AdminRepository {
         )) { rs ->
             while (rs.next()) {
                 rows += AdminSignupDaily(
+                    date = rs.getDate("day").toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE),
+                    googleCount = rs.getLong("google_count"),
+                    appleCount = rs.getLong("apple_count"),
+                )
+            }
+        }
+        rows
+    }
+
+    /**
+     * 회원탈퇴 요약 — account_deletions row 집계. 누적 + 최근 30일 + 체류기간(가입~탈퇴).
+     *
+     * 체류기간 avg/median 은 앱 코드에서 계산 — `EXTRACT(EPOCH FROM interval)` 등이 Postgres/H2
+     * 간 방언 차가 커서, 두 timestamp 만 읽어 Duration 으로 산출한다(탈퇴는 저빈도라 전량 스캔 OK).
+     * (AdminDeletionStats KDoc 참조)
+     */
+    fun getDeletionStats(): AdminDeletionStats = transaction {
+        val thirtyDaysAgo = Instant.now().minusSeconds(30L * 24 * 3600)
+        var total = 0L
+        var deletions30d = 0L
+        val tenureSeconds = mutableListOf<Long>()
+        val sql = "SELECT signed_up_at, deleted_at FROM account_deletions"
+        TransactionManager.current().exec(sql) { rs ->
+            while (rs.next()) {
+                total++
+                val signedUp = rs.getTimestamp("signed_up_at").toInstant()
+                val deleted = rs.getTimestamp("deleted_at").toInstant()
+                if (!deleted.isBefore(thirtyDaysAgo)) deletions30d++
+                tenureSeconds += java.time.Duration.between(signedUp, deleted).seconds.coerceAtLeast(0)
+            }
+        }
+        AdminDeletionStats(
+            totalDeletions = total,
+            deletions30d = deletions30d,
+            avgTenureDays = if (tenureSeconds.isEmpty()) 0.0
+            else round1(tenureSeconds.average() / 86_400.0),
+            medianTenureDays = if (tenureSeconds.isEmpty()) 0.0
+            else round1(medianOf(tenureSeconds) / 86_400.0),
+        )
+    }
+
+    /**
+     * 최근 시간창([windowHours]) 헬스 — Overview 헬스 카드용. 누적이 아닌 rolling window 라
+     * 오늘의 급성 실패 스파이크를 잡는다. 창 기준은 created_at(제출 시각) — render/separation 두
+     * 테이블에 공통 존재하고 external_api_calls 와도 일관. (AdminHealth KDoc 참조)
+     */
+    fun getRecentHealth(windowHours: Int): AdminHealth = transaction {
+        val since = Instant.now().minusSeconds(windowHours.toLong() * 3600)
+
+        // 잡: render(COMPLETED) + separation(READY) 을 성공으로, FAILED 를 실패로 — 창 내 종료분만.
+        fun jobsInWindow(table: String, successStatus: String): Pair<Long, Long> {
+            val sql = """
+                SELECT
+                    SUM(CASE WHEN status IN ('$successStatus', 'FAILED') THEN 1 ELSE 0 END) AS terminal,
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed
+                FROM $table
+                WHERE created_at >= ?
+            """.trimIndent()
+            var terminal = 0L
+            var failed = 0L
+            TransactionManager.current().exec(sql, args = listOf(instantArg(since))) { rs ->
+                if (rs.next()) {
+                    terminal = rs.getLong("terminal")
+                    failed = rs.getLong("failed")
+                }
+            }
+            return terminal to failed
+        }
+        val (renderTerminal, renderFailed) = jobsInWindow("render_jobs", "COMPLETED")
+        val (sepTerminal, sepFailed) = jobsInWindow("separation_jobs", "READY")
+
+        // 외부호출: getExternalCallsDaily 와 동일한 p95 방언 분기.
+        val isPostgres = TransactionManager.current().db.url.startsWith("jdbc:postgresql:")
+        val p95Expr = if (isPostgres) {
+            "COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0)::bigint"
+        } else {
+            "COALESCE(MAX(latency_ms), 0)"
+        }
+        val callSql = """
+            SELECT
+                COUNT(*) AS calls,
+                SUM(CASE WHEN success = false THEN 1 ELSE 0 END) AS failures,
+                $p95Expr AS p95
+            FROM external_api_calls
+            WHERE created_at >= ?
+        """.trimIndent()
+        var calls = 0L
+        var failures = 0L
+        var p95 = 0L
+        TransactionManager.current().exec(callSql, args = listOf(instantArg(since))) { rs ->
+            if (rs.next()) {
+                calls = rs.getLong("calls")
+                failures = rs.getLong("failures")
+                p95 = rs.getLong("p95")
+            }
+        }
+
+        AdminHealth(
+            windowHours = windowHours,
+            jobsTerminal = renderTerminal + sepTerminal,
+            jobsFailed = renderFailed + sepFailed,
+            upstreamCalls = calls,
+            upstreamFailures = failures,
+            upstreamP95Ms = p95,
+        )
+    }
+
+    /**
+     * 일별 탈퇴 수 + provider 분포. 가입 추이(getSignupDaily) 대비 이탈 비교용 — 동일 구조.
+     */
+    fun getDeletionDaily(fromInclusive: Instant, toExclusive: Instant): List<AdminDeletionDaily> = transaction {
+        val sql = """
+            SELECT
+                date_trunc('day', deleted_at)::date AS day,
+                SUM(CASE WHEN provider = 'google' THEN 1 ELSE 0 END) AS google_count,
+                SUM(CASE WHEN provider = 'apple'  THEN 1 ELSE 0 END) AS apple_count
+            FROM account_deletions
+            WHERE deleted_at >= ? AND deleted_at < ?
+            GROUP BY 1
+            ORDER BY 1
+        """.trimIndent()
+        val rows = mutableListOf<AdminDeletionDaily>()
+        TransactionManager.current().exec(sql, args = listOf(
+            instantArg(fromInclusive), instantArg(toExclusive),
+        )) { rs ->
+            while (rs.next()) {
+                rows += AdminDeletionDaily(
                     date = rs.getDate("day").toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE),
                     googleCount = rs.getLong("google_count"),
                     appleCount = rs.getLong("apple_count"),

@@ -1,9 +1,11 @@
 package com.vibi.bff
 
 import com.vibi.bff.config.DbConfig
+import com.vibi.bff.db.AccountDeletionsTable
 import com.vibi.bff.db.DbBootstrap
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AuthProvider
+import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.UserRepository
 import com.zaxxer.hikari.HikariDataSource
 import java.util.UUID
@@ -92,5 +94,27 @@ class UserRepositoryTest {
         assertFalse(repo.exists(UUID.randomUUID())) // 본 적 없는 UUID
         repo.delete(u.id)
         assertFalse(repo.exists(u.id))               // 삭제 후 false → A-1 차단의 기반
+    }
+
+    @Test
+    fun `delete records an account_deletions audit row with provider`() {
+        val u = repo.upsert(AuthProvider.APPLE, "a-del", "d@example.com", "D", null)
+        repo.delete(u.id)
+
+        val rows = transaction { AccountDeletionsTable.selectAll().toList() }
+        assertEquals(1, rows.size)
+        assertEquals("apple", rows.single()[AccountDeletionsTable.provider])
+
+        // 집계도 반영 — 누적/30일 모두 방금 탈퇴 1건.
+        val stats = AdminRepository().getDeletionStats()
+        assertEquals(1L, stats.totalDeletions)
+        assertEquals(1L, stats.deletions30d)
+    }
+
+    @Test
+    fun `delete of unknown user records no audit row`() {
+        repo.delete(UUID.randomUUID())
+        val count = transaction { AccountDeletionsTable.selectAll().count() }
+        assertEquals(0L, count)
     }
 }

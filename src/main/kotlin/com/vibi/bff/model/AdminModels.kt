@@ -160,6 +160,51 @@ data class AdminAdStats(
 )
 
 /**
+ * 회원탈퇴(계정 삭제) 요약. account_deletions row 를 집계 — 1 row = 탈퇴 1건.
+ *
+ * - [totalDeletions] — 누적 탈퇴 수 (V15 이후 적재분. 이전 하드 삭제분은 기록이 없어 미포함).
+ * - [deletions30d] — 최근 30일 윈도우 (rolling, now-30d 기준).
+ * - [avgTenureDays] / [medianTenureDays] — 가입~탈퇴 체류기간(일). 탈퇴 기록이 없으면 0.
+ *   "얼마 쓰고 나갔나" — signed_up_at 과 deleted_at 의 차이로 산출.
+ */
+@Serializable
+data class AdminDeletionStats(
+    val totalDeletions: Long,
+    val deletions30d: Long,
+    val avgTenureDays: Double,
+    val medianTenureDays: Double,
+)
+
+/**
+ * 최근 시간창(기본 24h) 헬스 — Overview 헬스 카드가 "지금" 문제를 잡도록 누적이 아닌 rolling
+ * window 로 집계. 성공률/실패율은 프론트가 계산 (분모 0·소표본 가드 포함).
+ *
+ * - [windowHours] — 집계 창(시간). 기본 24.
+ * - [jobsTerminal] / [jobsFailed] — 창 내 생성돼 종료(성공+실패)된 render+separation 잡 수 / 그중 실패.
+ * - [upstreamCalls] / [upstreamFailures] — 창 내 Perso 외부호출 수 / 실패 수.
+ * - [upstreamP95Ms] — 창 내 호출 latency p95 (Postgres percentile / H2 max 근사).
+ */
+@Serializable
+data class AdminHealth(
+    val windowHours: Int,
+    val jobsTerminal: Long,
+    val jobsFailed: Long,
+    val upstreamCalls: Long,
+    val upstreamFailures: Long,
+    val upstreamP95Ms: Long,
+)
+
+/**
+ * 일별 탈퇴 수 + provider(google/apple) 분포. 가입(AdminSignupDaily) 대비 이탈 추이 비교용.
+ */
+@Serializable
+data class AdminDeletionDaily(
+    val date: String,
+    val googleCount: Long,
+    val appleCount: Long,
+)
+
+/**
  * 사용자 role 변경 요청 바디 (`POST /admin/users/{id}/role`). [role] 은 'admin' | 'user'.
  * 일반 사용자를 운영자로 승격하거나 그 반대로 강등할 때 사용.
  */

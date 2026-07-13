@@ -105,6 +105,26 @@ fun Route.adminRoutes(
             call.respond(HttpStatusCode.OK, data)
         }
 
+        // 최근 시간창 헬스 — Overview 헬스 카드용. hours 1..168 (default 24).
+        get("/health") {
+            call.requireAdmin(jwtSecret)
+            val hours = (call.request.queryParameters["hours"]?.toIntOrNull() ?: 24).coerceIn(1, 168)
+            val data = withContext(Dispatchers.IO) { adminRepository.getRecentHealth(hours) }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 회원탈퇴 요약 — 누적 + 최근 30일 탈퇴 수 (account_deletions 집계).
+        get("/deletions") {
+            call.requireAdmin(jwtSecret)
+            val data = withContext(Dispatchers.IO) { adminRepository.getDeletionStats() }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 일별 탈퇴 추이 + provider 분포. 가입 추이 대비 이탈 비교.
+        get("/stats/deletions") {
+            call.respondDailyRange(jwtSecret, adminRepository::getDeletionDaily)
+        }
+
         // 잡 성공/실패 분해 — Overview 의 status 무관 카운트가 가리는 실동작 가시화.
         get("/jobs/status-breakdown") {
             call.requireAdmin(jwtSecret)

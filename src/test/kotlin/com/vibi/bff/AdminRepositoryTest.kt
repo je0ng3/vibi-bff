@@ -297,4 +297,71 @@ class AdminRepositoryTest {
         }
         role
     }
+
+    // ── getRecentHealth ──────────────────────────────────────────────────────
+
+    private fun insertCall(provider: String, endpoint: String, success: Boolean, latencyMs: Long) = transaction {
+        exec(
+            "INSERT INTO external_api_calls (provider, endpoint, success, latency_ms) " +
+                "VALUES ('$provider', '$endpoint', $success, $latencyMs)",
+        )
+    }
+
+    @Test
+    fun `recent health counts terminal and failed jobs plus upstream calls in window`() {
+        val u = users.upsert(AuthProvider.GOOGLE, "g-h", "h@example.com", "H", null)
+        // 방금 INSERT → created_at=now, 24h 창 안. terminal = 성공(COMPLETED/READY)+FAILED.
+        insertRenderJob(u.id, "COMPLETED")
+        insertRenderJob(u.id, "FAILED")
+        insertRenderJob(u.id, "PROCESSING")            // 진행중 — terminal 아님
+        insertSeparationJob(u.id, "READY")
+        insertSeparationJob(u.id, "FAILED")
+        insertSeparationJob(u.id, "QUEUED")            // 진행중 — terminal 아님
+        insertCall("perso", "audio-separation", success = true, latencyMs = 100)
+        insertCall("perso", "audio-separation", success = true, latencyMs = 300)
+        insertCall("perso", "audio-separation", success = false, latencyMs = 500)
+
+        val h = admin.getRecentHealth(24)
+        assertEquals(24, h.windowHours)
+        assertEquals(4, h.jobsTerminal)   // render COMPLETED+FAILED + sep READY+FAILED
+        assertEquals(2, h.jobsFailed)     // render FAILED + sep FAILED
+        assertEquals(3, h.upstreamCalls)
+        assertEquals(1, h.upstreamFailures)
+    }
+
+    // ── getDeletionStats tenure ──────────────────────────────────────────────
+
+    private fun insertDeletion(provider: String, signedUpAt: Instant, deletedAt: Instant) = transaction {
+        exec(
+            "INSERT INTO account_deletions (provider, signed_up_at, deleted_at) VALUES ('$provider', ?, ?)",
+            args = listOf<Pair<IColumnType<*>, Any?>>(
+                JavaInstantColumnType() to signedUpAt,
+                JavaInstantColumnType() to deletedAt,
+            ),
+        )
+    }
+
+    @Test
+    fun `deletion stats compute average and median tenure in days`() {
+        val now = Instant.now()
+        val day = 86_400L
+        // 체류기간 2·4·9일 → avg 5.0, median 4.0.
+        insertDeletion("apple", now.minusSeconds(2 * day), now)
+        insertDeletion("google", now.minusSeconds(4 * day), now)
+        insertDeletion("apple", now.minusSeconds(9 * day), now)
+
+        val stats = admin.getDeletionStats()
+        assertEquals(3, stats.totalDeletions)
+        assertEquals(3, stats.deletions30d)
+        assertEquals(5.0, stats.avgTenureDays)
+        assertEquals(4.0, stats.medianTenureDays)
+    }
+
+    @Test
+    fun `deletion stats are zero when no deletions`() {
+        val stats = admin.getDeletionStats()
+        assertEquals(0, stats.totalDeletions)
+        assertEquals(0.0, stats.avgTenureDays)
+        assertEquals(0.0, stats.medianTenureDays)
+    }
 }
