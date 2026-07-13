@@ -1,6 +1,7 @@
 name: Deploy to Cloud Run
 
-# main 푸시 / 수동 트리거 시 배포. 시크릿은 전부 GitHub Secrets → env-var 주입 (Secret Manager 미사용).
+# main 푸시 / 수동 트리거 시 배포. 민감 시크릿(DB/JWT/API 키 등)은 Secret Manager 참조(--set-secrets),
+# 그 외 설정·비민감 값은 GitHub Secrets/Variables → env-var 주입(--set-env-vars).
 on:
   push:
     branches: [main]
@@ -66,7 +67,8 @@ jobs:
           fi
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
-      # 시크릿 값에 '@' 가 있으면 ^@^ 구분자와 충돌해 배포가 깨진다 (DB_PASSWORD 등은 영숫자로 유지).
+      # 민감 시크릿은 --set-secrets 로 Secret Manager 참조(콘솔/리비전에 평문 미노출 + ^@^ 구분자
+      # 충돌 회피). --set-env-vars 에는 URL/플래그/OAuth client id 등 비민감 값만 둔다.
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy "$SERVICE_NAME" \
@@ -82,6 +84,7 @@ jobs:
             --no-cpu-throttling \
             --session-affinity \
             --allow-unauthenticated \
-            --set-env-vars "^@^PERSO_BASE_URL=${PERSO_BASE_URL}@PERSO_STORAGE_BASE_URL=${PERSO_STORAGE_BASE_URL}@STORAGE_PATH=${STORAGE_PATH}@GOOGLE_OAUTH_CLIENT_IDS=${{ secrets.GOOGLE_OAUTH_CLIENT_IDS }}@GOOGLE_OAUTH_CLIENT_ID=${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}@GOOGLE_OAUTH_CLIENT_SECRET=${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}@APPLE_OAUTH_CLIENT_IDS=${{ secrets.APPLE_OAUTH_CLIENT_IDS }}@CORS_ALLOWED_ORIGINS=${{ vars.CORS_ALLOWED_ORIGINS }}@R2_BUCKET=${{ vars.R2_BUCKET }}@R2_ACCOUNT_ID=${{ vars.R2_ACCOUNT_ID }}@ADMIN_SLUG=${{ secrets.ADMIN_SLUG }}@BFF_BASE_URL=${{ steps.bff_url.outputs.url }}@RATE_LIMIT_TRUSTED_PROXY_HOPS=${{ vars.RATE_LIMIT_TRUSTED_PROXY_HOPS }}@PERSO_API_KEY=${{ secrets.PERSO_API_KEY }}@PERSO_SPACE_SEQ=${{ secrets.PERSO_SPACE_SEQ }}@AUTH_JWT_SECRET=${{ secrets.AUTH_JWT_SECRET }}@SEPARATION_SIGNING_SECRET=${{ secrets.SEPARATION_SIGNING_SECRET }}@DATABASE_URL=${{ secrets.DATABASE_URL }}@DB_USER=${{ secrets.DB_USER }}@DB_PASSWORD=${{ secrets.DB_PASSWORD }}@R2_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}@R2_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --set-env-vars "^@^PERSO_BASE_URL=${PERSO_BASE_URL}@PERSO_STORAGE_BASE_URL=${PERSO_STORAGE_BASE_URL}@STORAGE_PATH=${STORAGE_PATH}@GOOGLE_OAUTH_CLIENT_IDS=${{ secrets.GOOGLE_OAUTH_CLIENT_IDS }}@GOOGLE_OAUTH_CLIENT_ID=${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}@GOOGLE_OAUTH_CLIENT_SECRET=${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}@APPLE_OAUTH_CLIENT_IDS=${{ secrets.APPLE_OAUTH_CLIENT_IDS }}@CORS_ALLOWED_ORIGINS=${{ vars.CORS_ALLOWED_ORIGINS }}@R2_BUCKET=${{ vars.R2_BUCKET }}@R2_ACCOUNT_ID=${{ vars.R2_ACCOUNT_ID }}@ADMIN_SLUG=${{ secrets.ADMIN_SLUG }}@BFF_BASE_URL=${{ steps.bff_url.outputs.url }}@RATE_LIMIT_TRUSTED_PROXY_HOPS=${{ vars.RATE_LIMIT_TRUSTED_PROXY_HOPS }}" \
+            --set-secrets "PERSO_API_KEY=PERSO_API_KEY:latest,PERSO_SPACE_SEQ=PERSO_SPACE_SEQ:latest,AUTH_JWT_SECRET=AUTH_JWT_SECRET:latest,SEPARATION_SIGNING_SECRET=SEPARATION_SIGNING_SECRET:latest,DATABASE_URL=DATABASE_URL:latest,DB_USER=DB_USER:latest,DB_PASSWORD=DB_PASSWORD:latest,R2_ACCESS_KEY_ID=R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=R2_SECRET_ACCESS_KEY:latest" \
             --quiet
           echo "::notice title=Deployed::${{ steps.bff_url.outputs.url }}"
