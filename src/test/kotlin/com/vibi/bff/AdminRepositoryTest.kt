@@ -60,11 +60,16 @@ class AdminRepositoryTest {
         )
     }
 
-    private fun insertSeparationJob(userId: UUID, status: String, client: String = "mobile") = transaction {
+    private fun insertSeparationJob(
+        userId: UUID,
+        status: String,
+        client: String = "mobile",
+        durationMs: Long = 1000,
+    ) = transaction {
         val id = "sep-" + UUID.randomUUID()
         exec(
             "INSERT INTO separation_jobs (id, user_id, source_duration_ms, status, client) " +
-                "VALUES ('$id', CAST('$userId' AS UUID), 1000, '$status', '$client')",
+                "VALUES ('$id', CAST('$userId' AS UUID), $durationMs, '$status', '$client')",
         )
     }
 
@@ -164,6 +169,46 @@ class AdminRepositoryTest {
         assertEquals(1, o.pluginSeparations)
     }
 
+    @Test
+    fun `overview sums current credit balance and drops when consumed`() {
+        val u1 = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        val u2 = users.upsert(AuthProvider.APPLE, "a-2", "b@example.com", "B", null)
+        credits.grantPurchase(u1.id, "apple", "tx-1", "vibi.credits.50", 50)
+        credits.grantPurchase(u2.id, "google", "tx-2", "vibi.credits.30", 30)
+        assertEquals(80, admin.getOverview().totalUserCredits) // 50 + 30
+
+        // 소비하면 그만큼 총합이 줄어든다.
+        credits.reserve(u1.id, "job-1", 20)
+        assertEquals(60, admin.getOverview().totalUserCredits) // 80 - 20
+    }
+
+    @Test
+    fun `overview credit total is zero on empty db`() {
+        assertEquals(0, admin.getOverview().totalUserCredits)
+    }
+
+    @Test
+    fun `overview averages separation length overall and by client`() {
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        // mobile: 2000, 4000 → 평균 3000. plugin: 10000 → 평균 10000. 전체 3건 평균 = 16000/3 = 5333.
+        insertSeparationJob(u.id, "READY", client = "mobile", durationMs = 2000)
+        insertSeparationJob(u.id, "READY", client = "mobile", durationMs = 4000)
+        insertSeparationJob(u.id, "READY", client = "plugin", durationMs = 10000)
+
+        val o = admin.getOverview()
+        assertEquals(5333, o.avgSeparationDurationMs)        // (2000+4000+10000)/3 절삭
+        assertEquals(3000, o.avgMobileSeparationDurationMs)  // (2000+4000)/2
+        assertEquals(10000, o.avgPluginSeparationDurationMs) // 10000/1
+    }
+
+    @Test
+    fun `overview separation averages are zero on empty db`() {
+        val o = admin.getOverview()
+        assertEquals(0, o.avgSeparationDurationMs)
+        assertEquals(0, o.avgMobileSeparationDurationMs)
+        assertEquals(0, o.avgPluginSeparationDurationMs)
+    }
+
     // getDailyStats 는 generate_series 사용으로 Postgres 전용 — H2 테스트 불가.
     // 클라이언트 분리 집계(SUM CASE WHEN client='plugin')는 breakdown/users 테스트가 동일 패턴 검증.
 
@@ -198,86 +243,58 @@ class AdminRepositoryTest {
         assertEquals("m@example.com", mobileRows.single().email)
     }
 
-    // ── getRevenue ───────────────────────────────────────────────────────────
+    // ── getAdStats ─────────────────────────────────────────────────────────
 
     @Test
-    fun `revenue aggregates purchases credits and paying users by platform`() {
+    fun `ad stats counts admob watches total 30d and distinct users`() {
+        // platform CHECK 제약을 풀어 admob INSERT 허용 (helper 이름은 admin 이지만 whitelist 전체 드롭).
+        allowAdminPlatformInH2()
         val u1 = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
         val u2 = users.upsert(AuthProvider.APPLE, "a-2", "b@example.com", "B", null)
-        credits.grantPurchase(u1.id, "apple", "tx-1", "vibi.credits.50", 50)
-        credits.grantPurchase(u1.id, "google", "tx-2", "vibi.credits.30", 30)
-        credits.grantPurchase(u2.id, "apple", "tx-3", "vibi.credits.50", 50)
-
-        val r = admin.getRevenue()
-        assertEquals(2, r.payingUsers)        // u1, u2 distinct
-        assertEquals(3, r.purchaseCount)
-        assertEquals(130, r.creditsSold)
-        assertEquals(2, r.applePurchaseCount)
-        assertEquals(1, r.googlePurchaseCount)
-        assertEquals(100, r.appleCredits)
-        assertEquals(30, r.googleCredits)
-        assertEquals(0, r.adminGrantedCredits) // H2 라 admin platform 미사용
-        // 방금 적립이라 모두 최근 30일 윈도우 안.
-        assertEquals(3, r.purchaseCount30d)
-        assertEquals(130, r.creditsSold30d)
-    }
-
-    @Test
-    fun `revenue excludes admin grants from sales but counts them in adminGrantedCredits`() {
-        allowAdminPlatformInH2()
-        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
         val now = Instant.now()
-        insertTxn(u.id, "apple", "tx-a", 50, now)
-        insertTxn(u.id, "google", "tx-g", 30, now)
-        insertTxn(u.id, "admin", "tx-admin", 100, now) // 수동 지급 — 매출 아님
+        insertTxn(u1.id, "admob", "ad-1", 1, now)
+        insertTxn(u1.id, "admob", "ad-2", 1, now)
+        insertTxn(u2.id, "admob", "ad-3", 1, now.minusSeconds(40L * 24 * 3600)) // 40일 전
+        insertTxn(u1.id, "apple", "tx-1", 50, now) // 결제 — 광고 집계에서 제외돼야 함
 
-        val r = admin.getRevenue()
-        assertEquals(80, r.creditsSold)          // apple+google 만, admin 제외
-        assertEquals(2, r.purchaseCount)         // admin row 제외
-        assertEquals(50, r.appleCredits)
-        assertEquals(30, r.googleCredits)
-        assertEquals(100, r.adminGrantedCredits) // admin 만 별도 합산
+        val s = admin.getAdStats()
+        assertEquals(3, s.totalWatches)   // admob 3건만 (apple 제외)
+        assertEquals(2, s.watches30d)     // 40일 전 1건 제외
+        assertEquals(2, s.watchingUsers)  // u1, u2 distinct
     }
 
     @Test
-    fun `revenue 30d window splits from cumulative total`() {
+    fun `ad stats is all zeros on empty db`() {
+        val s = admin.getAdStats()
+        assertEquals(0, s.totalWatches)
+        assertEquals(0, s.watches30d)
+        assertEquals(0, s.watchingUsers)
+    }
+
+    // ── setUserRole ──────────────────────────────────────────────────────────
+
+    @Test
+    fun `setUserRole promotes then demotes and returns update count`() {
         val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
-        insertTxn(u.id, "apple", "tx-now", 50, Instant.now())
-        insertTxn(u.id, "apple", "tx-old", 20, Instant.now().minusSeconds(40L * 24 * 3600)) // 40일 전
+        assertEquals("user", currentRole(u.id))
 
-        val r = admin.getRevenue()
-        assertEquals(70, r.creditsSold)      // 누적엔 둘 다 포함
-        assertEquals(2, r.purchaseCount)
-        assertEquals(50, r.creditsSold30d)   // 30일 윈도우엔 최근 것만
-        assertEquals(1, r.purchaseCount30d)
+        assertEquals(1, admin.setUserRole(u.id, "admin"))
+        assertEquals("admin", currentRole(u.id))
+
+        assertEquals(1, admin.setUserRole(u.id, "user"))
+        assertEquals("user", currentRole(u.id))
     }
 
     @Test
-    fun `revenue is all zeros on empty db`() {
-        val r = admin.getRevenue()
-        assertEquals(0, r.payingUsers)
-        assertEquals(0, r.purchaseCount)
-        assertEquals(0, r.creditsSold)
-        assertEquals(0, r.appleCredits)
-        assertEquals(0, r.googleCredits)
-        assertEquals(0, r.adminGrantedCredits)
+    fun `setUserRole returns zero for unknown user`() {
+        assertEquals(0, admin.setUserRole(UUID.randomUUID(), "admin"))
     }
 
-    // ── getRevenueDaily ──────────────────────────────────────────────────────
-
-    @Test
-    fun `revenue daily groups credits by platform within range`() {
-        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
-        credits.grantPurchase(u.id, "apple", "tx-1", "vibi.credits.50", 50)
-        credits.grantPurchase(u.id, "google", "tx-2", "vibi.credits.30", 30)
-
-        val from = Instant.now().minusSeconds(2L * 24 * 3600)
-        val to = Instant.now().plusSeconds(24L * 3600)
-        val rows = admin.getRevenueDaily(from, to)
-
-        // 모두 오늘 적립 → 한 버킷에 합산.
-        assertEquals(50, rows.sumOf { it.appleCredits })
-        assertEquals(30, rows.sumOf { it.googleCredits })
-        assertEquals(2, rows.sumOf { it.purchaseCount })
+    private fun currentRole(userId: UUID): String = transaction {
+        var role = ""
+        exec("SELECT role FROM users WHERE id = CAST('$userId' AS UUID)") { rs ->
+            if (rs.next()) role = rs.getString(1)
+        }
+        role
     }
 }

@@ -80,6 +80,12 @@ data class AdminOverview(
     val pluginSeparations: Long = 0,
     val totalSourceDurationMs: Long,
     val activeUsersLast7Days: Long,
+    // 전체 사용자가 현재 보유한 크레딧 잔액 합계 (user_credits.balance 의 SUM). 소비 후 잔액 기준.
+    val totalUserCredits: Long = 0,
+    // 음원분리 잡 1건당 평균 입력 길이 ms. 전체 + 클라이언트별 (mobile/plugin). 잡이 없으면 0.
+    val avgSeparationDurationMs: Long = 0,
+    val avgMobileSeparationDurationMs: Long = 0,
+    val avgPluginSeparationDurationMs: Long = 0,
 )
 
 /**
@@ -138,45 +144,28 @@ data class AdminSignupDaily(
 )
 
 /**
- * 수익/IAP 요약. 출시 직전 "실제로 결제하는 사용자가 있는가" 에 답하는 패널.
+ * 보상형 광고(AdMob) 시청 요약. 보상형 광고 1회 시청 완료 = SSV 콜백 1건 =
+ * credit_transactions 의 platform='admob' row 1건 (1회당 1 크레딧). 따라서 "광고 시청 횟수" 는
+ * admob row 수로 집계한다.
  *
- * 주의 — BFF 는 영수증의 화폐 금액(₩/$)을 저장하지 않는다. credit_transactions 는
- * platform/product_id/credits 만 보관하므로 매출은 "판매된 크레딧 수" 로 표현한다.
- * admin-grant(platform='admin') 는 수익이 아니므로 모든 매출 집계에서 제외하고,
- * [adminGrantedCredits] 로만 참고 노출한다.
- *
- * - [payingUsers] — 실결제 1건 이상 보유 distinct user (탈퇴로 user_id NULL 인 row 는 제외).
- * - [creditsSold] — 누적 판매 크레딧 (apple+google).
- * - [...30d] — 최근 30일 윈도우 (rolling, now-30d 기준).
- *
- * 비대칭 주의 — [payingUsers] 는 탈퇴(user_id NULL) 결제자를 제외하지만 [creditsSold]/
- * [purchaseCount]/platform 별 합계는 탈퇴자 결제 row 도 포함한다. 따라서 두 값을 나눠
- * ARPU 류 파생 지표를 만들면 분자(크레딧)에 탈퇴자가 있고 분모(결제자)엔 없어 왜곡된다 —
- * 파생 지표 추가 시 분자/분모 기준을 일치시킬 것.
+ * - [totalWatches] — 누적 광고 시청 완료 횟수.
+ * - [watches30d] — 최근 30일 윈도우 (rolling, now-30d 기준).
+ * - [watchingUsers] — 광고를 1회 이상 시청한 distinct user (탈퇴로 user_id NULL 인 row 는 제외).
  */
 @Serializable
-data class AdminRevenue(
-    val payingUsers: Long,
-    val purchaseCount: Long,
-    val creditsSold: Long,
-    val purchaseCount30d: Long,
-    val creditsSold30d: Long,
-    val applePurchaseCount: Long,
-    val googlePurchaseCount: Long,
-    val appleCredits: Long,
-    val googleCredits: Long,
-    val adminGrantedCredits: Long,
+data class AdminAdStats(
+    val totalWatches: Long,
+    val watches30d: Long,
+    val watchingUsers: Long,
 )
 
 /**
- * 일별 IAP 추세. admin-grant 제외. credits 는 platform 별로 분리해 스택 차트로 표시.
+ * 사용자 role 변경 요청 바디 (`POST /admin/users/{id}/role`). [role] 은 'admin' | 'user'.
+ * 일반 사용자를 운영자로 승격하거나 그 반대로 강등할 때 사용.
  */
 @Serializable
-data class AdminRevenueDaily(
-    val date: String,
-    val appleCredits: Long,
-    val googleCredits: Long,
-    val purchaseCount: Long,
+data class AdminSetRoleRequest(
+    val role: String,
 )
 
 /**

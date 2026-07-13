@@ -4,13 +4,12 @@ import {
   adminFetch,
   AdminAuthError,
   AdminActiveJob,
+  AdminAdStats,
   AdminDailyStats,
   AdminDurationBucket,
   AdminExternalCallDaily,
   AdminJobStatusBreakdown,
   AdminOverview,
-  AdminRevenue,
-  AdminRevenueDaily,
   AdminSignupDaily,
 } from "../lib/api";
 import { formatDurationMs } from "../lib/format";
@@ -20,14 +19,11 @@ import HistogramChart from "../components/HistogramChart";
 import ExternalCallsTable from "../components/ExternalCallsTable";
 import SignupChart from "../components/SignupChart";
 import ActiveJobsTable from "../components/ActiveJobsTable";
-import RevenuePanel from "../components/RevenuePanel";
-import RevenueChart from "../components/RevenueChart";
 import JobStatusTable from "../components/JobStatusTable";
 
 interface State {
   overview: AdminOverview | null;
-  revenue: AdminRevenue | null;
-  revenueDaily: AdminRevenueDaily[];
+  ads: AdminAdStats | null;
   jobStatus: AdminJobStatusBreakdown[];
   daily: AdminDailyStats[];
   externalCalls: AdminExternalCallDaily[];
@@ -39,7 +35,7 @@ interface State {
 }
 
 const INITIAL: State = {
-  overview: null, revenue: null, revenueDaily: [], jobStatus: [],
+  overview: null, ads: null, jobStatus: [],
   daily: [], externalCalls: [], histogram: [], activeJobs: [], signups: [],
   loading: true, error: null,
 };
@@ -52,11 +48,10 @@ export default function DashboardPage() {
     let cancelled = false;
     (async () => {
       try {
-        const [overview, revenue, revenueDaily, jobStatus, daily, externalCalls, histogram, activeJobs, signups] =
+        const [overview, ads, jobStatus, daily, externalCalls, histogram, activeJobs, signups] =
           await Promise.all([
             adminFetch<AdminOverview>("/api/v2/admin/overview"),
-            adminFetch<AdminRevenue>("/api/v2/admin/revenue"),
-            adminFetch<AdminRevenueDaily[]>("/api/v2/admin/revenue/daily"),
+            adminFetch<AdminAdStats>("/api/v2/admin/ads"),
             adminFetch<AdminJobStatusBreakdown[]>("/api/v2/admin/jobs/status-breakdown"),
             adminFetch<AdminDailyStats[]>("/api/v2/admin/stats/daily"),
             adminFetch<AdminExternalCallDaily[]>("/api/v2/admin/stats/external-calls"),
@@ -65,7 +60,7 @@ export default function DashboardPage() {
             adminFetch<AdminSignupDaily[]>("/api/v2/admin/stats/signups"),
           ]);
         if (!cancelled) setState({
-          overview, revenue, revenueDaily, jobStatus,
+          overview, ads, jobStatus,
           daily, externalCalls, histogram, activeJobs, signups,
           loading: false, error: null,
         });
@@ -87,6 +82,17 @@ export default function DashboardPage() {
     <div className="space-y-10">
       <section>
         <h1 className="text-xl font-semibold">Overview</h1>
+        <div className="mt-4 rounded-lg border border-blue-200 bg-blue-50 p-6">
+          <div className="text-xs font-medium uppercase tracking-wide text-blue-700">
+            전체 사용자 보유 크레딧 총합
+          </div>
+          <div className="mt-2 text-4xl font-bold tabular-nums tracking-tight text-blue-900">
+            {o.totalUserCredits.toLocaleString()}
+          </div>
+          <div className="mt-1 text-sm text-blue-700">
+            × 60 = {(o.totalUserCredits * 60).toLocaleString()}
+          </div>
+        </div>
         <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
           <StatCard label="Users" value={o.totalUsers.toLocaleString()} />
           <StatCard label="Active (7d)" value={o.activeUsersLast7Days.toLocaleString()} />
@@ -97,25 +103,46 @@ export default function DashboardPage() {
             sub={`모바일 ${o.mobileSeparations.toLocaleString()} · 플러그인 ${o.pluginSeparations.toLocaleString()}`}
           />
         </div>
-        <div className="mt-4">
+        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
           <StatCard
-            label="Total uploaded duration"
-            value={formatDurationMs(o.totalSourceDurationMs)}
-            sub="render 잡 입력 길이 합계 (separation 제외)"
+            label="Avg separation length"
+            value={formatDurationMs(o.avgSeparationDurationMs)}
+            sub="음원분리 잡 1건당 평균 입력 길이 (전체)"
+          />
+          <StatCard
+            label="Avg separation · mobile"
+            value={formatDurationMs(o.avgMobileSeparationDurationMs)}
+            sub="모바일 앱 분리 잡 평균"
+          />
+          <StatCard
+            label="Avg separation · plugin"
+            value={formatDurationMs(o.avgPluginSeparationDurationMs)}
+            sub="Adobe 플러그인 분리 잡 평균"
           />
         </div>
       </section>
 
       <section>
-        <h2 className="text-lg font-semibold">Revenue (IAP)</h2>
+        <h2 className="text-lg font-semibold">Ad watches</h2>
         <p className="mt-1 text-sm text-neutral-500">
-          크레딧 인앱결제 — 결제자 / 판매 크레딧 / Apple·Google 분포. 금액은 미저장이라 크레딧 수로 표시, admin 지급 제외.
+          보상형 광고(AdMob) 시청 완료 횟수. 1회 시청 = 1 크레딧 지급. 결제 통계는 제거됨.
         </p>
-        <div className="mt-4">
-          {state.revenue ? <RevenuePanel revenue={state.revenue} /> : null}
-        </div>
-        <div className="mt-4 rounded-lg border border-neutral-200 bg-white p-4">
-          <RevenueChart data={state.revenueDaily} />
+        <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3">
+          <StatCard
+            label="Total ad watches"
+            value={(state.ads?.totalWatches ?? 0).toLocaleString()}
+            sub="누적 광고 시청 횟수"
+          />
+          <StatCard
+            label="Ad watches (30d)"
+            value={(state.ads?.watches30d ?? 0).toLocaleString()}
+            sub="최근 30일"
+          />
+          <StatCard
+            label="Watching users"
+            value={(state.ads?.watchingUsers ?? 0).toLocaleString()}
+            sub="광고 1회 이상 시청 사용자"
+          />
         </div>
       </section>
 
@@ -136,16 +163,6 @@ export default function DashboardPage() {
         </p>
         <div className="mt-4">
           <ActiveJobsTable rows={state.activeJobs} />
-        </div>
-      </section>
-
-      <section>
-        <h2 className="text-lg font-semibold">External API calls</h2>
-        <p className="mt-1 text-sm text-neutral-500">
-          Perso 호출 카운트 + 실패율 + p95 latency. 비용 추정 + 안정성 모니터.
-        </p>
-        <div className="mt-4">
-          <ExternalCallsTable rows={state.externalCalls} />
         </div>
       </section>
 
@@ -180,6 +197,16 @@ export default function DashboardPage() {
           </div>
         </section>
       </div>
+
+      <section>
+        <h2 className="text-lg font-semibold">External API calls</h2>
+        <p className="mt-1 text-sm text-neutral-500">
+          Perso 호출 카운트 + 실패율 + p95 latency. 비용 추정 + 안정성 모니터.
+        </p>
+        <div className="mt-4">
+          <ExternalCallsTable rows={state.externalCalls} />
+        </div>
+      </section>
     </div>
   );
 }

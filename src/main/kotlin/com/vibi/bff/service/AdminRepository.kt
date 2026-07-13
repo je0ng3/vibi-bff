@@ -1,13 +1,13 @@
 package com.vibi.bff.service
 
+import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminActiveJob
+import com.vibi.bff.model.AdminAdStats
 import com.vibi.bff.model.AdminDailyStats
 import com.vibi.bff.model.AdminDurationBucket
 import com.vibi.bff.model.AdminExternalCallDaily
 import com.vibi.bff.model.AdminJobStatusBreakdown
 import com.vibi.bff.model.AdminOverview
-import com.vibi.bff.model.AdminRevenue
-import com.vibi.bff.model.AdminRevenueDaily
 import com.vibi.bff.model.AdminSignupDaily
 import com.vibi.bff.model.AdminUserJob
 import com.vibi.bff.model.AdminUserOverview
@@ -21,6 +21,7 @@ import org.jetbrains.exposed.sql.UUIDColumnType
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
 
 private val INSTANT_T = JavaInstantColumnType()
 private val TEXT_T = TextColumnType()
@@ -50,7 +51,7 @@ class AdminRepository {
      * 날짜 단위는 UTC. 빈 날짜는 결과에 포함되지 않음 — 호출자가 필요하면 채워서 표시.
      */
     fun getDailyStats(fromInclusive: Instant, toExclusive: Instant): List<AdminDailyStats> = transaction {
-        // 별칭은 'bucket_date' — 'day' 는 H2(PostgreSQL mode) 예약어 (getRevenueDaily 와 동일).
+        // 별칭은 'bucket_date' — 'day' 는 H2(PostgreSQL mode) 예약어라 AS day 가 깨진다.
         val sql = """
             SELECT
                 d::date AS bucket_date,
@@ -372,80 +373,48 @@ class AdminRepository {
     }
 
     /**
-     * 수익/IAP 요약. credit_transactions 에서 admin-grant 제외 집계 + admin grant 참고값.
-     * 화폐 금액은 미저장 — "판매된 크레딧 수" 로 매출 표현. (AdminRevenue KDoc 참조)
+     * 보상형 광고(AdMob) 시청 요약. credit_transactions 의 platform='admob' row 를 집계 —
+     * 1 row = 광고 1회 시청 완료(= SSV 콜백 1건, 1 크레딧). (AdminAdStats KDoc 참조)
      */
-    fun getRevenue(): AdminRevenue = transaction {
+    fun getAdStats(): AdminAdStats = transaction {
         val thirtyDaysAgo = Instant.now().minusSeconds(30L * 24 * 3600)
         val sql = """
             SELECT
-                COUNT(*) AS purchase_count,
-                COUNT(DISTINCT user_id) AS paying_users,
-                COALESCE(SUM(credits), 0) AS credits_sold,
-                COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS purchase_count_30d,
-                COALESCE(SUM(CASE WHEN created_at >= ? THEN credits ELSE 0 END), 0) AS credits_sold_30d,
-                COALESCE(SUM(CASE WHEN platform = 'apple'  THEN 1 ELSE 0 END), 0) AS apple_count,
-                COALESCE(SUM(CASE WHEN platform = 'google' THEN 1 ELSE 0 END), 0) AS google_count,
-                COALESCE(SUM(CASE WHEN platform = 'apple'  THEN credits ELSE 0 END), 0) AS apple_credits,
-                COALESCE(SUM(CASE WHEN platform = 'google' THEN credits ELSE 0 END), 0) AS google_credits
+                COUNT(*) AS total_watches,
+                COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS watches_30d,
+                COUNT(DISTINCT user_id) AS watching_users
             FROM credit_transactions
-            WHERE platform <> 'admin'
+            WHERE platform = 'admob'
         """.trimIndent()
-        var revenue = AdminRevenue(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        TransactionManager.current().exec(sql, args = listOf(
-            instantArg(thirtyDaysAgo), instantArg(thirtyDaysAgo),
-        )) { rs ->
+        var stats = AdminAdStats(0, 0, 0)
+        TransactionManager.current().exec(sql, args = listOf(instantArg(thirtyDaysAgo))) { rs ->
             if (rs.next()) {
-                revenue = revenue.copy(
-                    purchaseCount = rs.getLong("purchase_count"),
-                    payingUsers = rs.getLong("paying_users"),
-                    creditsSold = rs.getLong("credits_sold"),
-                    purchaseCount30d = rs.getLong("purchase_count_30d"),
-                    creditsSold30d = rs.getLong("credits_sold_30d"),
-                    applePurchaseCount = rs.getLong("apple_count"),
-                    googlePurchaseCount = rs.getLong("google_count"),
-                    appleCredits = rs.getLong("apple_credits"),
-                    googleCredits = rs.getLong("google_credits"),
+                stats = AdminAdStats(
+                    totalWatches = rs.getLong("total_watches"),
+                    watches30d = rs.getLong("watches_30d"),
+                    watchingUsers = rs.getLong("watching_users"),
                 )
             }
         }
-        revenue.copy(
-            adminGrantedCredits = scalarLong(
-                "SELECT COALESCE(SUM(credits), 0) FROM credit_transactions WHERE platform = 'admin'",
-            ),
-        )
+        stats
     }
 
     /**
-     * 일별 IAP 추세 (admin-grant 제외). 빈 날짜는 미포함 — 호출자/프론트가 채워서 표시.
+     * [userId] 의 role 을 [role] ('admin' | 'user') 로 변경. 갱신된 row 수(0 또는 1) 반환 —
+     * 존재하지 않는 userId 면 0.
+     *
+     * 주의 — JWT 는 발급 시점 role 클레임을 그대로 쓰므로 (Auth.kt 참조) 승격/강등은 대상
+     * 사용자가 재로그인해 새 토큰을 받기 전까지 반영되지 않는다. 즉시 강등으로 세션을 끊는
+     * 용도로는 부적합.
+     *
+     * 예외로 raw SQL 대신 Exposed DSL 사용 — update count 를 명시적으로 돌려받기 위함.
      */
-    fun getRevenueDaily(fromInclusive: Instant, toExclusive: Instant): List<AdminRevenueDaily> = transaction {
-        // 별칭은 'bucket_date' — 'day' 는 H2(PostgreSQL mode) 예약어라 AS day 가 깨진다.
-        val sql = """
-            SELECT
-                date_trunc('day', created_at)::date AS bucket_date,
-                COALESCE(SUM(CASE WHEN platform = 'apple'  THEN credits ELSE 0 END), 0) AS apple_credits,
-                COALESCE(SUM(CASE WHEN platform = 'google' THEN credits ELSE 0 END), 0) AS google_credits,
-                COUNT(*) AS purchase_count
-            FROM credit_transactions
-            WHERE platform <> 'admin' AND created_at >= ? AND created_at < ?
-            GROUP BY 1
-            ORDER BY 1
-        """.trimIndent()
-        val rows = mutableListOf<AdminRevenueDaily>()
-        TransactionManager.current().exec(sql, args = listOf(
-            instantArg(fromInclusive), instantArg(toExclusive),
-        )) { rs ->
-            while (rs.next()) {
-                rows += AdminRevenueDaily(
-                    date = rs.getDate("bucket_date").toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE),
-                    appleCredits = rs.getLong("apple_credits"),
-                    googleCredits = rs.getLong("google_credits"),
-                    purchaseCount = rs.getLong("purchase_count"),
-                )
-            }
+    fun setUserRole(userId: UUID, role: String): Int = transaction {
+        require(role == "admin" || role == "user") { "role must be 'admin' or 'user' (got $role)" }
+        UsersTable.update({ UsersTable.id eq userId }) {
+            it[UsersTable.role] = role
+            it[UsersTable.updatedAt] = Instant.now()
         }
-        rows
     }
 
     /**
@@ -510,6 +479,15 @@ class AdminRepository {
             mobileSeparations = totalSeparations - pluginSeparations,
             pluginSeparations = pluginSeparations,
             totalSourceDurationMs = scalarLong("SELECT COALESCE(SUM(source_duration_ms), 0) FROM render_jobs"),
+            totalUserCredits = scalarLong("SELECT COALESCE(SUM(balance), 0) FROM user_credits"),
+            // AVG 는 numeric/double 반환 — getLong 이 소수부 절삭 (ms 표시엔 충분). 잡 0건이면 COALESCE 로 0.
+            avgSeparationDurationMs = scalarLong("SELECT COALESCE(AVG(source_duration_ms), 0) FROM separation_jobs"),
+            avgMobileSeparationDurationMs = scalarLong(
+                "SELECT COALESCE(AVG(source_duration_ms), 0) FROM separation_jobs WHERE client <> 'plugin'",
+            ),
+            avgPluginSeparationDurationMs = scalarLong(
+                "SELECT COALESCE(AVG(source_duration_ms), 0) FROM separation_jobs WHERE client = 'plugin'",
+            ),
             activeUsersLast7Days = scalarLong(
                 """
                     SELECT COUNT(DISTINCT user_id) FROM (
