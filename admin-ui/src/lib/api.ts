@@ -37,6 +37,36 @@ export async function adminFetch<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * mutating admin 액션용 POST. adminFetch 와 동일한 인증/에러 규약 — 401 은 토큰 비우고
+ * AdminAuthError, 403 은 AdminAuthError(forbidden), 그 외 비 2xx 는 Error.
+ */
+export async function adminPost<T>(path: string, body: unknown): Promise<T> {
+  const auth = loadAuth();
+  if (!auth) throw new AdminAuthError("missing_token");
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${auth.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+  if (res.status === 401) {
+    clearAuth();
+    throw new AdminAuthError("unauthorized");
+  }
+  if (res.status === 403) {
+    throw new AdminAuthError("forbidden");
+  }
+  if (!res.ok) {
+    throw new Error(`BFF ${path} returned ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
 /** Google ID Token → BFF JWT 교환. 응답 그대로 — caller 가 role 확인 후 저장. */
 export async function exchangeGoogleIdToken(idToken: string): Promise<{
   accessToken: string;
@@ -64,6 +94,12 @@ export interface AdminOverview {
   pluginSeparations: number;
   totalSourceDurationMs: number;
   activeUsersLast7Days: number;
+  /** 전체 사용자가 현재 보유한 크레딧 잔액 합계 (소비하면 줄어든다). */
+  totalUserCredits: number;
+  /** 음원분리 잡 1건당 평균 입력 길이 ms — 전체 + 클라이언트별. 잡이 없으면 0. */
+  avgSeparationDurationMs: number;
+  avgMobileSeparationDurationMs: number;
+  avgPluginSeparationDurationMs: number;
 }
 
 export interface AdminDailyStats {
@@ -137,24 +173,32 @@ export interface AdminSignupDaily {
   appleCount: number;
 }
 
-export interface AdminRevenue {
-  payingUsers: number;
-  purchaseCount: number;
-  creditsSold: number;
-  purchaseCount30d: number;
-  creditsSold30d: number;
-  applePurchaseCount: number;
-  googlePurchaseCount: number;
-  appleCredits: number;
-  googleCredits: number;
-  adminGrantedCredits: number;
+export interface AdminAdStats {
+  totalWatches: number;
+  watches30d: number;
+  watchingUsers: number;
 }
 
-export interface AdminRevenueDaily {
+export interface AdminDeletionStats {
+  totalDeletions: number;
+  deletions30d: number;
+  avgTenureDays: number;
+  medianTenureDays: number;
+}
+
+export interface AdminHealth {
+  windowHours: number;
+  jobsTerminal: number;
+  jobsFailed: number;
+  upstreamCalls: number;
+  upstreamFailures: number;
+  upstreamP95Ms: number;
+}
+
+export interface AdminDeletionDaily {
   date: string;
-  appleCredits: number;
-  googleCredits: number;
-  purchaseCount: number;
+  googleCount: number;
+  appleCount: number;
 }
 
 export interface AdminJobStatusBreakdown {

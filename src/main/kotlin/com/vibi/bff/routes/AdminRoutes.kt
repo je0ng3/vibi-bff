@@ -1,5 +1,6 @@
 package com.vibi.bff.routes
 
+import com.vibi.bff.model.AdminSetRoleRequest
 import com.vibi.bff.model.AdminUserJobsResponse
 import com.vibi.bff.model.AdminUsersResponse
 import com.vibi.bff.plugins.ApiErrorException
@@ -8,9 +9,11 @@ import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.service.AdminRepository
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
+import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import java.time.Instant
 import java.time.LocalDate
@@ -24,7 +27,8 @@ import kotlinx.coroutines.withContext
  * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
  * role=admin JWT 강제. URL slug 숨김 (landing middleware) + role 검사 이중 방어.
  *
- * v1 은 KPI / 일별 추세 / 사용자별 사용량 / 사용자별 잡 4개. mutating action 없음.
+ * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). 유일한 mutating action 은 사용자 role
+ * 승격/강등 (`POST /users/{userId}/role`) — 운영자가 일반 사용자를 admin 으로 올린다.
  *
  * 주의 — KDoc 안에 slash + asterisk 시퀀스는 nested comment 로 파싱돼 컴파일 깨짐.
  * 와일드카드 표현 필요 시 "..." 으로 대체.
@@ -94,16 +98,31 @@ fun Route.adminRoutes(
             call.respondDailyRange(jwtSecret, adminRepository::getSignupDaily)
         }
 
-        // 수익/IAP 요약 — 결제자 수 + 판매 크레딧 + platform 분포 (admin-grant 제외).
-        get("/revenue") {
+        // 보상형 광고(AdMob) 시청 요약 — 누적/30일 시청 횟수 + 시청 사용자 수.
+        get("/ads") {
             call.requireAdmin(jwtSecret)
-            val data = withContext(Dispatchers.IO) { adminRepository.getRevenue() }
+            val data = withContext(Dispatchers.IO) { adminRepository.getAdStats() }
             call.respond(HttpStatusCode.OK, data)
         }
 
-        // 일별 IAP 추세 (admin-grant 제외). from/to 기본 30일.
-        get("/revenue/daily") {
-            call.respondDailyRange(jwtSecret, adminRepository::getRevenueDaily)
+        // 최근 시간창 헬스 — Overview 헬스 카드용. hours 1..168 (default 24).
+        get("/health") {
+            call.requireAdmin(jwtSecret)
+            val hours = (call.request.queryParameters["hours"]?.toIntOrNull() ?: 24).coerceIn(1, 168)
+            val data = withContext(Dispatchers.IO) { adminRepository.getRecentHealth(hours) }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 회원탈퇴 요약 — 누적 + 최근 30일 탈퇴 수 (account_deletions 집계).
+        get("/deletions") {
+            call.requireAdmin(jwtSecret)
+            val data = withContext(Dispatchers.IO) { adminRepository.getDeletionStats() }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 일별 탈퇴 추이 + provider 분포. 가입 추이 대비 이탈 비교.
+        get("/stats/deletions") {
+            call.respondDailyRange(jwtSecret, adminRepository::getDeletionDaily)
         }
 
         // 잡 성공/실패 분해 — Overview 의 status 무관 카운트가 가리는 실동작 가시화.
@@ -128,6 +147,32 @@ fun Route.adminRoutes(
                 adminRepository.getUserJobs(userId, limit, offset)
             }
             call.respond(HttpStatusCode.OK, AdminUserJobsResponse(jobs = rows, total = total))
+        }
+
+        // 사용자 role 승격/강등 — 유일한 mutating admin 액션. body {role: 'admin'|'user'}.
+        // 자기 자신 role 변경은 차단 (마지막 운영자 자가 강등에 의한 lockout 방지 + 오조작 방어).
+        // JWT 는 발급 시점 role 을 쓰므로 대상 사용자는 재로그인 후 반영 (AdminRepository.setUserRole 참조).
+        post("/users/{userId}/role") {
+            val principal = call.requireAdmin(jwtSecret)
+            val userIdParam = call.parameters["userId"]
+                ?: throw NotFoundException("userId required")
+            val userId = try {
+                UUID.fromString(userIdParam)
+            } catch (e: IllegalArgumentException) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
+            }
+            val body = call.receive<AdminSetRoleRequest>()
+            if (body.role != "admin" && body.role != "user") {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_role")
+            }
+            if (userId == principal.userId) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "cannot_change_own_role")
+            }
+            val updated = withContext(Dispatchers.IO) {
+                adminRepository.setUserRole(userId, body.role)
+            }
+            if (updated == 0) throw NotFoundException("user not found")
+            call.respond(HttpStatusCode.OK, AdminSetRoleRequest(role = body.role))
         }
     }
 }

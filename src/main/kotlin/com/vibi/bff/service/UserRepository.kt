@@ -1,5 +1,6 @@
 package com.vibi.bff.service
 
+import com.vibi.bff.db.AccountDeletionsTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AuthProvider
 import java.time.Instant
@@ -7,6 +8,7 @@ import java.util.UUID
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.upsert
@@ -86,8 +88,23 @@ class UserRepository {
      * 이전 잡 분석 row 는 새 사용자와 다른 UUID — 익명 row 로 영구 격리된다.
      *
      * 반환: 실제 삭제된 row 수 (0 = 존재하지 않던 user — 호출자가 200/404 로 분기 가능).
+     *
+     * 삭제 직전, 같은 트랜잭션에서 [AccountDeletionsTable] 에 탈퇴 사건 1 row 를 적재한다
+     * (provider + 가입시각만, PII 없음). 원자적이라 "삭제됐는데 집계 누락"이 발생하지 않는다.
+     * user row 가 없으면(이미 삭제/무효 JWT) 로그도 남기지 않는다.
      */
     fun delete(userId: UUID): Int = transaction {
+        val snapshot = UsersTable
+            .select(UsersTable.provider, UsersTable.createdAt)
+            .where { UsersTable.id eq userId }
+            .firstOrNull()
+        if (snapshot != null) {
+            AccountDeletionsTable.insert {
+                it[provider] = snapshot[UsersTable.provider]
+                it[signedUpAt] = snapshot[UsersTable.createdAt]
+                it[deletedAt] = Instant.now()
+            }
+        }
         UsersTable.deleteWhere { UsersTable.id eq userId }
     }
 

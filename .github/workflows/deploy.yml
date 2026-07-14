@@ -1,8 +1,7 @@
 name: Deploy to Cloud Run
 
-# main 푸시 시 자동 배포 + 수동 트리거 (Actions UI 의 Run workflow 버튼).
-# 최초 1회 부트스트랩 (SA 생성, API 활성화, Secret Manager 시드) 은 deploy/cloud-run.sh 로 끝내두고,
-# 이 워크플로우는 매 배포마다 런타임 SA / env / secret / 리소스 스펙을 declarative 하게 wire 한다.
+# main 푸시 / 수동 트리거 시 배포. 민감 시크릿(DB/JWT/API 키 등)은 Secret Manager 참조(--set-secrets),
+# 그 외 설정·비민감 값은 GitHub Secrets/Variables → env-var 주입(--set-env-vars).
 on:
   push:
     branches: [main]
@@ -11,13 +10,10 @@ on:
 env:
   SERVICE_NAME: vibi-bff
   REGION: us-central1
-  GEMINI_PROJECT_ID: est-perso-vt-prod
-  GEMINI_LOCATION: us-central1
   PERSO_BASE_URL: https://api.perso.ai
   PERSO_STORAGE_BASE_URL: https://portal-media.perso.ai
   STORAGE_PATH: /tmp/storage
 
-# Cloud Run 동시 배포 충돌 방지 — main 에 빠르게 연속 푸시되면 마지막 것만 살린다.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
@@ -27,16 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write   # WIF OIDC 토큰 발급에 필수
+      id-token: write   # WIF OIDC
 
     steps:
-      # 서드파티 액션은 commit SHA 로 핀 — 이 job 은 WIF(id-token) + 전체 prod 시크릿을 쥐므로
-      # 태그 재지정/계정 탈취 액션이 임의 코드를 돌리면 프로덕션 전체가 노출된다. (주석=버전 라벨)
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      # admin-ui (Vite) 빌드 산출물은 .gitignore 됨 — 매 배포마다 fresh build 해서
-      # src/main/resources/admin/ 로 떨어뜨려야 Ktor staticResources 가 마운트한다.
-      # 빠뜨리면 ADMIN_SLUG 가 박혀도 부팅 로그에 WARN + admin URL 404.
+      # admin-ui 빌드 산출물은 .gitignore — 매 배포마다 build 해서 src/main/resources/admin/ 로 떨군다.
       - name: Set up Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -47,8 +39,6 @@ jobs:
       - name: Build admin-ui (vite)
         working-directory: admin-ui
         env:
-          # Vite 는 `VITE_*` 를 빌드 타임에 번들에 인라인 — Cloud Run runtime env 로는 닿지 않는다.
-          # 누락 시 LoginPage 가 "VITE_GOOGLE_OAUTH_CLIENT_ID_ADMIN 빌드 env 가 없습니다." 로 표시.
           VITE_GOOGLE_OAUTH_CLIENT_ID_ADMIN: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID_ADMIN }}
         run: |
           npm ci --silent
@@ -65,49 +55,20 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      # BFF_BASE_URL 출처 (deploy 전 미리 결정 — deploy 단계 한 번에 wire 하기 위함):
-      #   1. vars.BFF_BASE_URL 가 있으면 그 값 (커스텀 도메인 운영 시 — 예: https://api.vibi.fm)
-      #   2. 없으면 기존 Cloud Run 자동 URL describe (service 가 이미 존재할 때)
-      #   3. 둘 다 없으면 최초 배포 — 빈 값으로 진행하고 다음 push 에서 (2) 로 자동 채움
-      #
-      # 과거에는 deploy + 별도 `update --update-env-vars BFF_BASE_URL=...` 두 step 으로 처리해
-      # **매 push 마다 revision 이 2개 생성** → 처리 중인 separation 잡 인스턴스가 두 번 죽을
-      # 기회. 한 step 으로 합쳐 revision 1개 / push 로 정상화.
+      # BFF_BASE_URL: vars.BFF_BASE_URL 우선, 없으면 기존 Cloud Run URL, 최초 배포면 빈 값(다음 push 에서 채움).
       - name: Determine BFF_BASE_URL
         id: bff_url
         run: |
-          VAR_URL="${{ vars.BFF_BASE_URL }}"
-          if [ -n "$VAR_URL" ]; then
-            URL="$VAR_URL"
-            echo "Using vars.BFF_BASE_URL: $URL"
-          else
+          URL="${{ vars.BFF_BASE_URL }}"
+          if [ -z "$URL" ]; then
             URL=$(gcloud run services describe "$SERVICE_NAME" \
-              --region "$REGION" \
-              --project "${{ secrets.GCP_PROJECT_ID }}" \
+              --region "$REGION" --project "${{ secrets.GCP_PROJECT_ID }}" \
               --format='value(status.url)' 2>/dev/null || echo "")
-            if [ -n "$URL" ]; then
-              echo "Falling back to Cloud Run default URL: $URL"
-            else
-              echo "::warning::Service '$SERVICE_NAME' not found — BFF_BASE_URL will be empty this revision; rerun the workflow to populate."
-            fi
           fi
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
-      # min-instances=0 → 유휴 시 scale-to-zero 라 비용 0 (Oracle VM 이전 전 min=1 의 24/7 비용 제거).
-      # 단 렌더 ffmpeg / separation dispatcher 폴링은 백그라운드라, 요청이 없으면 Cloud Run 이 CPU 를
-      # throttle 해 멈춘다 → --no-cpu-throttling 으로 CPU 항상 할당 (instance-기반 과금이지만 완전 유휴
-      # 시엔 인스턴스가 죽어 $0). 첫 submit 은 콜드 스타트(~5-15s) 감수. 잡은 로컬 디스크/in-memory 에
-      # 핀돼 있어 polling client 를 같은 인스턴스로 보내는 --session-affinity 는 유지.
-      # IAP(인앱결제) 자격증명 배선:
-      #   - Apple: 5개 모두 env-var 로 주입 (GitHub Secrets/Variables). 미설정이면 빈 값 → AppConfig
-      #     가 Apple IAP 비활성(purchase 시 iap_unconfigured 400) — 배포는 안 깨진다. 값 채우면 즉시
-      #     활성화. IAP_APPLE_PRIVATE_KEY(.p8 PEM)는 GitHub Secret 에 **한 줄 `\n` literal** 로 저장
-      #     (AppConfig 가 \n→실제 개행 복원). 필요값: Secrets=IAP_APPLE_ISSUER_ID/KEY_ID/PRIVATE_KEY,
-      #     Variables=IAP_APPLE_BUNDLE_ID/ENV(production|sandbox)/IAP_GOOGLE_PACKAGE_NAME.
-      #   - Google(Android): service account JSON 은 client_email 의 '@' 가 ^@^ 구분자와 충돌 + 비밀이라
-      #     env-var 부적합 → Secret Manager 필요. 안드로이드 결제가 아직 mock 이라 보류. 실연동 시:
-      #     (1) `gcloud secrets create IAP_GOOGLE_SERVICE_ACCOUNT_JSON --data-file=sa.json`
-      #     (2) 아래 --set-secrets 에 `,IAP_GOOGLE_SERVICE_ACCOUNT_JSON=IAP_GOOGLE_SERVICE_ACCOUNT_JSON:latest` 추가.
+      # 민감 시크릿은 --set-secrets 로 Secret Manager 참조(콘솔/리비전에 평문 미노출 + ^@^ 구분자
+      # 충돌 회피). --set-env-vars 에는 URL/플래그/OAuth client id 등 비민감 값만 둔다.
       - name: Deploy to Cloud Run
         run: |
           gcloud run deploy "$SERVICE_NAME" \
@@ -123,7 +84,7 @@ jobs:
             --no-cpu-throttling \
             --session-affinity \
             --allow-unauthenticated \
-            --set-env-vars "^@^GEMINI_PROJECT_ID=${GEMINI_PROJECT_ID}@GEMINI_LOCATION=${GEMINI_LOCATION}@PERSO_BASE_URL=${PERSO_BASE_URL}@PERSO_STORAGE_BASE_URL=${PERSO_STORAGE_BASE_URL}@STORAGE_PATH=${STORAGE_PATH}@GOOGLE_OAUTH_CLIENT_IDS=${{ secrets.GOOGLE_OAUTH_CLIENT_IDS }}@GOOGLE_OAUTH_CLIENT_ID=${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}@GOOGLE_OAUTH_CLIENT_SECRET=${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}@APPLE_OAUTH_CLIENT_IDS=${{ secrets.APPLE_OAUTH_CLIENT_IDS }}@CORS_ALLOWED_ORIGINS=${{ vars.CORS_ALLOWED_ORIGINS }}@R2_BUCKET=${{ vars.R2_BUCKET }}@R2_ACCOUNT_ID=${{ vars.R2_ACCOUNT_ID }}@ADMIN_SLUG=${{ secrets.ADMIN_SLUG }}@IAP_APPLE_ISSUER_ID=${{ secrets.IAP_APPLE_ISSUER_ID }}@IAP_APPLE_KEY_ID=${{ secrets.IAP_APPLE_KEY_ID }}@IAP_APPLE_PRIVATE_KEY=${{ secrets.IAP_APPLE_PRIVATE_KEY }}@IAP_APPLE_BUNDLE_ID=${{ vars.IAP_APPLE_BUNDLE_ID }}@IAP_APPLE_ENV=${{ vars.IAP_APPLE_ENV }}@IAP_GOOGLE_PACKAGE_NAME=${{ vars.IAP_GOOGLE_PACKAGE_NAME }}@BFF_BASE_URL=${{ steps.bff_url.outputs.url }}@RATE_LIMIT_TRUSTED_PROXY_HOPS=${{ vars.RATE_LIMIT_TRUSTED_PROXY_HOPS }}@MAX_SEPARATION_MINUTES=${{ vars.MAX_SEPARATION_MINUTES }}" \
+            --set-env-vars "^@^PERSO_BASE_URL=${PERSO_BASE_URL}@PERSO_STORAGE_BASE_URL=${PERSO_STORAGE_BASE_URL}@STORAGE_PATH=${STORAGE_PATH}@GOOGLE_OAUTH_CLIENT_IDS=${{ secrets.GOOGLE_OAUTH_CLIENT_IDS }}@GOOGLE_OAUTH_CLIENT_ID=${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}@GOOGLE_OAUTH_CLIENT_SECRET=${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}@APPLE_OAUTH_CLIENT_IDS=${{ secrets.APPLE_OAUTH_CLIENT_IDS }}@CORS_ALLOWED_ORIGINS=${{ vars.CORS_ALLOWED_ORIGINS }}@R2_BUCKET=${{ vars.R2_BUCKET }}@R2_ACCOUNT_ID=${{ vars.R2_ACCOUNT_ID }}@ADMIN_SLUG=${{ secrets.ADMIN_SLUG }}@BFF_BASE_URL=${{ steps.bff_url.outputs.url }}@RATE_LIMIT_TRUSTED_PROXY_HOPS=${{ vars.RATE_LIMIT_TRUSTED_PROXY_HOPS }}" \
             --set-secrets "PERSO_API_KEY=PERSO_API_KEY:latest,PERSO_SPACE_SEQ=PERSO_SPACE_SEQ:latest,AUTH_JWT_SECRET=AUTH_JWT_SECRET:latest,SEPARATION_SIGNING_SECRET=SEPARATION_SIGNING_SECRET:latest,DATABASE_URL=DATABASE_URL:latest,DB_USER=DB_USER:latest,DB_PASSWORD=DB_PASSWORD:latest,R2_ACCESS_KEY_ID=R2_ACCESS_KEY_ID:latest,R2_SECRET_ACCESS_KEY=R2_SECRET_ACCESS_KEY:latest" \
             --quiet
           echo "::notice title=Deployed::${{ steps.bff_url.outputs.url }}"

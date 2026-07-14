@@ -8,21 +8,22 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { AdminRevenueDaily } from "../lib/api";
+import type { AdminDeletionDaily } from "../lib/api";
 
 /**
- * 일별 판매 크레딧 — Apple/Google 스택 area. admin-grant 제외 (수익만).
+ * 일별 회원탈퇴 — Google/Apple 스택 area. 가입(SignupChart) 대비 이탈 비교용.
+ * 색은 이탈 신호로 rose 계열. V15 이전 하드 삭제분은 기록이 없어 그래프에 안 나온다.
  */
-export default function RevenueChart({ data }: { data: AdminRevenueDaily[] }) {
-  const total = data.reduce((acc, d) => acc + d.appleCredits + d.googleCredits, 0);
+export default function DeletionChart({ data }: { data: AdminDeletionDaily[] }) {
+  const total = data.reduce((acc, d) => acc + d.googleCount + d.appleCount, 0);
   if (total === 0) {
     return (
       <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-neutral-300 text-sm text-neutral-500">
-        선택 기간에 결제 내역이 없습니다.
+        선택 기간에 탈퇴가 없습니다.
       </div>
     );
   }
-  const rows = data.map((d) => ({ date: d.date.slice(5), Apple: d.appleCredits, Google: d.googleCredits }));
+  const rows = data.map((d) => ({ date: d.date.slice(5), Google: d.googleCount, Apple: d.appleCount }));
   return (
     <div className="h-56 w-full">
       <ResponsiveContainer width="100%" height="100%">
@@ -39,8 +40,8 @@ export default function RevenueChart({ data }: { data: AdminRevenueDaily[] }) {
             }}
           />
           <Legend wrapperStyle={{ fontSize: 12 }} />
-          <Area type="monotone" dataKey="Apple" stackId="1" stroke="#171717" fill="#171717" fillOpacity={0.6} />
-          <Area type="monotone" dataKey="Google" stackId="1" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.6} />
+          <Area type="monotone" dataKey="Apple" stackId="1" stroke="#9f1239" fill="#9f1239" fillOpacity={0.55} />
+          <Area type="monotone" dataKey="Google" stackId="1" stroke="#f43f5e" fill="#f43f5e" fillOpacity={0.55} />
         </AreaChart>
       </ResponsiveContainer>
     </div>

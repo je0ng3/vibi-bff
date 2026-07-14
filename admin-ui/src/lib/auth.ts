@@ -32,12 +32,21 @@ export function clearAuth(): void {
 
 /** JWT payload 의 role 클레임을 파싱 — UI 분기 (예: admin 아니면 즉시 로그아웃) 용도. */
 export function decodeRole(token: string): string | null {
+  return decodeClaim<string>(token, "role");
+}
+
+/** JWT payload 의 sub(=본인 userId) 를 파싱 — 자기 자신 role 변경 버튼을 숨기는 UI 분기용. */
+export function decodeSub(token: string): string | null {
+  return decodeClaim<string>(token, "sub");
+}
+
+function decodeClaim<T>(token: string, key: string): T | null {
   try {
     const payload = token.split(".")[1];
     if (!payload) return null;
     const json = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
-    const obj = JSON.parse(json) as { role?: string };
-    return obj.role ?? null;
+    const obj = JSON.parse(json) as Record<string, unknown>;
+    return (obj[key] as T) ?? null;
   } catch {
     return null;
   }

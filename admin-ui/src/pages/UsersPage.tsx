@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { adminFetch, AdminAuthError, AdminUsersResponse } from "../lib/api";
+import { adminFetch, adminPost, AdminAuthError, AdminUsersResponse } from "../lib/api";
+import { loadAuth, decodeSub } from "../lib/auth";
 import { formatDurationMs, formatIsoDateTime } from "../lib/format";
 
 const PAGE_SIZE = 50;
@@ -13,10 +14,35 @@ export default function UsersPage() {
   // 클라이언트 필터 — 잡 이력 기준 (mobile: render 또는 mobile 분리, plugin: plugin 분리).
   const clientFilter = params.get("client") ?? "";
 
+  // 로그인한 운영자 본인의 userId — 자기 role 변경 버튼을 숨긴다 (서버도 400 으로 차단).
+  const auth = loadAuth();
+  const selfId = auth ? decodeSub(auth.token) : null;
+
   // 검색 input — 사용자가 타이핑 중인 raw 값. URL/요청에는 debounce 적용.
   const [queryDraft, setQueryDraft] = useState(queryFromUrl);
   const [data, setData] = useState<AdminUsersResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // role 변경 진행 중인 userId (버튼 중복 클릭 방지 + 스피너 표시).
+  const [pendingRole, setPendingRole] = useState<string | null>(null);
+
+  async function changeRole(userId: string, nextRole: "admin" | "user") {
+    const label = nextRole === "admin" ? "관리자로 승격" : "일반 사용자로 강등";
+    if (!window.confirm(`${label}하시겠습니까? (대상 사용자는 재로그인 후 반영됩니다)`)) return;
+    setPendingRole(userId);
+    try {
+      await adminPost(`/api/v2/admin/users/${userId}/role`, { role: nextRole });
+      setData((prev) =>
+        prev
+          ? { ...prev, users: prev.users.map((u) => (u.userId === userId ? { ...u, role: nextRole } : u)) }
+          : prev,
+      );
+    } catch (e) {
+      if (e instanceof AdminAuthError) { navigate("/login", { replace: true }); return; }
+      window.alert(e instanceof Error ? e.message : "role 변경 실패");
+    } finally {
+      setPendingRole(null);
+    }
+  }
 
   // 250ms debounce — 빠른 타이핑 시 매 키스트로크에 fetch 안 함.
   useEffect(() => {
@@ -108,6 +134,7 @@ export default function UsersPage() {
                 <th className="px-4 py-3 text-right">Sep (plugin)</th>
                 <th className="px-4 py-3 text-right">Uploaded</th>
                 <th className="px-4 py-3">Last activity</th>
+                <th className="px-4 py-3 text-right">Role 변경</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-neutral-100">
@@ -135,6 +162,29 @@ export default function UsersPage() {
                   <td className="px-4 py-3 text-right tabular-nums">{u.pluginSeparations.toLocaleString()}</td>
                   <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(u.totalSourceDurationMs)}</td>
                   <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(u.lastActivityAt)}</td>
+                  <td className="px-4 py-3 text-right">
+                    {u.userId === selfId ? (
+                      <span className="text-xs text-neutral-400">본인</span>
+                    ) : u.role === "admin" ? (
+                      <button
+                        type="button"
+                        disabled={pendingRole === u.userId}
+                        onClick={() => changeRole(u.userId, "user")}
+                        className="rounded border border-neutral-300 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-100 disabled:opacity-50"
+                      >
+                        {pendingRole === u.userId ? "변경 중…" : "관리자 해제"}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={pendingRole === u.userId}
+                        onClick={() => changeRole(u.userId, "admin")}
+                        className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                      >
+                        {pendingRole === u.userId ? "변경 중…" : "관리자로 승격"}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
