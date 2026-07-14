@@ -6,6 +6,18 @@ import { formatDurationMs, formatIsoDateTime } from "../lib/format";
 
 const PAGE_SIZE = 50;
 
+// 로그인 provider 배지 스타일. 통합(링크)된 계정은 2개가 나란히 표시된다.
+const PROVIDER_BADGE: Record<string, string> = {
+  google: "bg-red-50 text-red-700 border border-red-200",
+  apple: "bg-neutral-900 text-white border border-neutral-900",
+};
+function providerBadgeClass(p: string): string {
+  return PROVIDER_BADGE[p] ?? "bg-neutral-100 text-neutral-600 border border-neutral-200";
+}
+function providerLabel(p: string): string {
+  return p.length ? p.charAt(0).toUpperCase() + p.slice(1) : p;
+}
+
 export default function UsersPage() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
@@ -145,6 +157,18 @@ export default function UsersPage() {
                       {u.name || u.email}
                     </Link>
                     <div className="text-xs text-neutral-500">{u.email}</div>
+                    {u.linkedProviders.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {u.linkedProviders.map((p) => (
+                          <span
+                            key={p}
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${providerBadgeClass(p)}`}
+                          >
+                            {providerLabel(p)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <span

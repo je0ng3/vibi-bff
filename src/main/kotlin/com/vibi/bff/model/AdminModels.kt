@@ -40,6 +40,8 @@ data class AdminUserOverview(
     val pluginSeparations: Long = 0,
     val totalSourceDurationMs: Long,
     val lastActivityAt: String,
+    /** 이 계정에 연결된 로그인 provider 목록 (primary 먼저 + 링크된 secondary). 통합 안 한 계정은 1개. */
+    val linkedProviders: List<String> = emptyList(),
 )
 
 @Serializable
