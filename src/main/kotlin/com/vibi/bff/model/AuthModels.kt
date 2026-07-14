@@ -10,7 +10,30 @@ import kotlinx.serialization.Serializable
 enum class AuthProvider(val dbValue: String) {
     GOOGLE("google"),
     APPLE("apple"),
+    ;
+
+    companion object {
+        /** wire/DB provider 문자열 → enum (대소문자 무시). 미지원 값은 null — [dbValue] 의 역함수.
+         *  provider 파싱의 단일 소스 — 라우트가 개별 `when` 으로 재구현하지 않도록. */
+        fun fromDbValue(raw: String?): AuthProvider? =
+            raw?.lowercase()?.let { v -> entries.firstOrNull { it.dbValue == v } }
+    }
 }
+
+/**
+ * provider ID Token 검증만 통과한 identity — 아직 DB 계정에 매핑되기 전.
+ *
+ * 로그인 경로는 이 값을 `resolveOrCreate` 로 계정에 upsert 하고, 계정 통합(링크) 경로는
+ * DB upsert 없이 [com.vibi.bff.service.UserRepository.linkOrMerge] 에 그대로 전달한다.
+ * AuthService 의 검증 로직을 두 경로가 공유하도록 중간 표현으로 둔다.
+ */
+data class VerifiedIdentity(
+    val provider: AuthProvider,
+    val providerSub: String,
+    val email: String,
+    val name: String,
+    val picture: String?,
+)
 
 @Serializable
 data class GoogleAuthRequest(
@@ -51,6 +74,36 @@ data class AuthResponse(
     val accessToken: String,
     val expiresAt: Long,
     val user: AuthUser,
+)
+
+/** 계정에 연결된 로그인 수단 1개. [primary] 는 최초 가입 provider(항상 1개). */
+@Serializable
+data class LinkedIdentity(
+    val provider: String,
+    val email: String,
+    val primary: Boolean,
+)
+
+/** GET /auth/identities · DELETE /auth/link/{provider} 응답 — 연결된 identity 목록. */
+@Serializable
+data class IdentitiesResponse(
+    val identities: List<LinkedIdentity>,
+)
+
+/**
+ * POST /auth/link/{provider} 응답.
+ *
+ * - [status] — "linked" (신규 연결) / "already_linked" (멱등) / "merged" (다른 계정을 흡수).
+ * - [mergedCredits] — merged 시 이월된 크레딧 (무료 보너스 제외한 결제·광고분).
+ * - [creditBalance] — merged 시 병합 후 현재 계정 잔액.
+ * - [identities] — 연결 후 전체 identity 목록 (클라이언트 UI 갱신용).
+ */
+@Serializable
+data class LinkResponse(
+    val status: String,
+    val creditBalance: Int? = null,
+    val mergedCredits: Int? = null,
+    val identities: List<LinkedIdentity>,
 )
 
 /**

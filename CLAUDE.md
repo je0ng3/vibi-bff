@@ -29,7 +29,7 @@ Swagger UI at `/swagger`. 환경 변수 표 + API 상세는 `README.md`.
 - `Application.kt` — entry point. `loadDotenv` (real env > sys prop > .env), `loadConfig`, `DbBootstrap.init`, HttpClient + 모든 서비스 wiring, CallLogging (signed-URL token / OAuth code 마스킹), 종료 hook (httpClient + render/separation shutdown + dataSource close).
 - `Constants.kt` — `MAX_UPLOAD_FILE_SIZE` 등.
 - `config/AppConfig.kt` — HOCON + env var loading (StorageConfig·PersoConfig·SeparationConfig·AuthConfig·DbConfig). 각 config 의 `init { require(...) }` 가 boot 시 fail-fast.
-- `db/Database.kt` (DbBootstrap, HikariCP) + Exposed 테이블 (`UsersTable` `(provider, providerSub)` unique + 크레딧 ledger / job analytics / external-call 로그).
+- `db/Database.kt` (DbBootstrap, HikariCP) + Exposed 테이블 (`UsersTable` `(provider, providerSub)` unique = 계정+primary identity, `UserIdentitiesTable` = 링크된 secondary identity + 크레딧 ledger / job analytics / external-call 로그).
 - `plugins/` — CORS, Serialization (`AppJson = Json { ignoreUnknownKeys=true, encodeDefaults=true }`), `ErrorHandling` (StatusPages), `Routing`.
 - `routes/` — `/api/v2` (`AuthRoutes` · `CreditRoutes` · `AssetRoutes` · `RenderRoutes` (+ `/inputs`, `/v3`) · `SeparationRoutes` · `AdminRoutes` · `DownloadResponder`·`MultipartUtils` 헬퍼). dev mock 으로 `/testdata/separation/*`.
 - `model/` — `AuthModels` · `CreditModels` · `AdminModels` · `BffModels` · `PersoModels`. BFF DTO 와 Perso upstream DTO 분리, `@SerialName` 으로 snake_case ↔ camelCase 매핑.
@@ -41,6 +41,9 @@ Swagger UI at `/swagger`. 환경 변수 표 + API 상세는 `README.md`.
 
 ```
 POST   /api/v2/auth/{google,apple}        # ID Token → BFF JWT 교환
+POST   /api/v2/auth/link/{google,apple}   # 계정 통합 — 현재 계정에 2nd provider 연결/병합 (인증 필요)
+DELETE /api/v2/auth/link/{provider}       # 연결 해제 (최소 1개 유지, primary 해제 시 secondary 승격)
+GET    /api/v2/auth/identities            # 연결된 로그인 수단 목록
 DELETE /api/v2/auth/account               # 계정 삭제 (인증 필요)
 GET    /api/v2/credits                    # 잔액 (+ GET /credits/cost 견적)
 POST   /api/v2/credits/purchase           # StoreKit2 / Play Billing 영수증 검증 → 적립
@@ -60,6 +63,14 @@ GET    /api/v2/testdata/separation/*      # (dev mock)
 ## Known BFF bug patterns
 
 새 multipart endpoint 추가 시 / 외부 API 호출 추가 시 여기 먼저 확인. 새 버그 만나면 append.
+
+### 계정 통합(account linking) — 계정 = users, 로그인 수단 = users(primary) + user_identities(secondary)
+
+**모델**: `users` row 하나가 계정 + 최초 가입 provider(primary identity). 추가로 링크된 provider 는 `UserIdentitiesTable` 에 secondary 로 담긴다. 인증 조회 `UserRepository.resolveOrCreate` 는 primary(users) → secondary(user_identities) 순 — **로그인 흐름은 반드시 `resolveOrCreate` 사용** (구 `upsert` 는 primary-only 저수준 API. 링크된 identity 로그인 시 `upsert` 를 타면 spurious 신규 계정 생성). 한 계정당 provider 는 1개 (google+apple 최대 2 identity).
+
+**병합 크레딧 규칙 (load-bearing)**: 다른 계정 B 를 흡수할 때 무료 가입 보너스(`SIGNUP_BONUS_CREDITS`, `credit_ledger(kind='signup')`)는 중복 이월 금지. 이월액 = `min(B.balance, SUM(credit_transactions.credits for B))` — `credit_transactions` 는 결제/광고/admin 획득분만 담고 signup 은 `credit_ledger` 라 자동 제외. B 의 잡(`render_jobs`/`separation_jobs`)·결제이력(`credit_transactions`)은 **B 삭제 전에** user_id 를 A 로 re-point (FK `ON DELETE SET NULL` 로 유실 방지). **`credit_ledger` 는 re-point 안 함** — B 의 in-flight 잡 consume row 를 A 로 옮기면 잡 실패 시 예약분 전액이 A 로 환불돼 캡을 우회(무료 보너스 부활)하므로, 병합을 정산 시점으로 보고 orphan(SET NULL)시켜 이후 환불을 no-op 화. carry 는 balance 에만 반영(감사용 ledger row 없음 — 재구성 소스 아님). 상세 `UserRepository.mergeAccounts`.
+
+**H2 테스트 주의**: `credit_transactions.platform` CHECK 는 H2 에서 V5 의 hash-named 제약이 살아있어 `admob`/`admin` 이 거부된다 (V9/V13 의 named DROP 이 H2 hash 명과 unmatch — prod Postgres 에선 정상). 병합 SUM 은 platform 무관이라, 테스트는 `google`/`apple` 로 획득 크레딧을 표현하면 동일 경로를 탄다.
 
 ### Perso STT / 음원 분리는 전용 endpoint 사용 — `submitTranslate` 우회 트릭 폐기
 

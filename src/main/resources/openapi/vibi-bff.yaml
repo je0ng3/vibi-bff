@@ -91,6 +91,130 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
 
+  /api/v2/auth/link/google:
+    post:
+      tags: [Auth]
+      summary: 현재 계정에 Google 로그인 연결 (계정 통합)
+      description: |
+        로그인된 사용자(Authorization JWT)가 자기 계정에 Google 을 **추가 로그인 수단**으로
+        연결한다. Google ID Token 을 검증한 뒤:
+          • 어느 계정에도 없던 identity → 현재 계정에 연결 (`status=linked`).
+          • 이미 현재 계정에 연결됨 → 멱등 (`status=already_linked`).
+          • 다른 계정 B 소속 → **B 를 현재 계정으로 병합** (`status=merged`). 무료 가입 보너스는
+            중복 이월하지 않고, 결제·광고로 획득한 크레딧만 합산 (`mergedCredits`). B 의 잡·거래
+            이력은 현재 계정으로 re-point 후 B 삭제.
+        현재 계정(또는 병합 대상)이 이미 같은 provider 를 보유하면 409 `provider_already_linked`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoogleAuthRequest' }
+      responses:
+        '200':
+          description: 연결/병합 성공
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LinkResponse' }
+        '401':
+          description: ID Token 검증 실패 또는 미인증
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: 같은 provider 가 이미 연결됨 (provider_already_linked)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v2/auth/link/apple:
+    post:
+      tags: [Auth]
+      summary: 현재 계정에 Apple 로그인 연결 (계정 통합)
+      description: |
+        `/auth/link/google` 의 Apple 판. Apple ID Token(JWKS RS256) 검증 후 동일한 연결/병합
+        규칙을 적용한다. `fullName` 은 최초 동의 시에만 제공되며 신규 secondary identity 표시명에 쓰인다.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppleAuthRequest' }
+      responses:
+        '200':
+          description: 연결/병합 성공
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LinkResponse' }
+        '401':
+          description: ID Token 검증 실패 또는 미인증
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: 같은 provider 가 이미 연결됨 (provider_already_linked)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v2/auth/link/{provider}:
+    delete:
+      tags: [Auth]
+      summary: 연결된 로그인 수단 해제
+      description: |
+        현재 계정에서 `{provider}`(google|apple) 로그인 연결을 해제한다. 계정엔 **최소 1개**
+        로그인 수단이 남아야 하며(마지막 해제는 409 `cannot_unlink_last_identity`), primary 를
+        해제하면 남은 secondary 가 primary 로 승격된다 — 계정 UUID/크레딧/잡은 유지.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [google, apple] }
+      responses:
+        '200':
+          description: 해제 완료 — 남은 identity 목록 반환
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentitiesResponse' }
+        '401':
+          description: 미인증
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          description: 해당 provider 가 연결돼 있지 않음 (identity_not_linked)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: 마지막 남은 로그인 수단이라 해제 불가 (cannot_unlink_last_identity)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v2/auth/identities:
+    get:
+      tags: [Auth]
+      summary: 현재 계정에 연결된 로그인 수단 목록
+      description: 모바일 '계정 연결' 화면용. primary 1개 + 연결된 secondary 들.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: identity 목록
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdentitiesResponse' }
+        '401':
+          description: 미인증
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /api/v2/auth/account:
     delete:
       tags: [Auth]
@@ -589,6 +713,48 @@ components:
           format: int64
           description: epoch millis
         user: { $ref: '#/components/schemas/AuthUser' }
+
+    LinkedIdentity:
+      type: object
+      required: [provider, email, primary]
+      properties:
+        provider:
+          type: string
+          enum: [google, apple]
+        email:
+          type: string
+        primary:
+          type: boolean
+          description: 최초 가입 provider 면 true (계정당 정확히 1개)
+
+    IdentitiesResponse:
+      type: object
+      required: [identities]
+      properties:
+        identities:
+          type: array
+          items: { $ref: '#/components/schemas/LinkedIdentity' }
+
+    LinkResponse:
+      type: object
+      required: [status, identities]
+      properties:
+        status:
+          type: string
+          enum: [linked, already_linked, merged]
+          description: linked=신규 연결, already_linked=멱등, merged=다른 계정 흡수
+        mergedCredits:
+          type: integer
+          nullable: true
+          description: merged 시 이월된 크레딧 (무료 보너스 제외한 결제·광고 획득분)
+        creditBalance:
+          type: integer
+          nullable: true
+          description: merged 시 병합 후 현재 계정 잔액
+        identities:
+          type: array
+          description: 연결 후 전체 identity 목록
+          items: { $ref: '#/components/schemas/LinkedIdentity' }
 
     # -------------------------- Credits
     CreditBalanceResponse:
