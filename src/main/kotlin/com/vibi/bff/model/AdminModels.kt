@@ -70,6 +70,35 @@ data class AdminUserJobsResponse(
 )
 
 /**
+ * 사용자 상세 페이지에 표시할 계정 연결/병합 정보.
+ *
+ * - [identities] — 이 계정에 연결된 로그인 수단 전체 (primary=최초 가입 provider + 링크된 secondary).
+ *   통합 안 한 계정은 1개. 사용자 대면 GET /auth/identities 와 동일한 [LinkedIdentity] 를 재사용해
+ *   (provider/email/primary) 조립 로직·DTO 가 한 곳([UserRepository.listIdentities])에만 있도록 한다.
+ * - [merges] — 이 계정으로 흡수된 다른 계정의 병합 이력 (account_merges). 병합이 없었으면 빈 리스트.
+ */
+@Serializable
+data class AdminUserAccount(
+    val identities: List<LinkedIdentity>,
+    val merges: List<AdminAccountMerge>,
+)
+
+/**
+ * 이 계정으로 흡수된 병합 이벤트 한 건 (account_merges 1 row).
+ *
+ * - [fromProvider] / [fromEmail] — 흡수돼 사라진 계정의 provider + 이메일.
+ * - [carriedCredits] — 이 병합으로 이월된 크레딧 (무료 가입 보너스 제외분. 0 일 수 있음).
+ * - [mergedAt] — 병합 시각 (ISO-8601 instant).
+ */
+@Serializable
+data class AdminAccountMerge(
+    val fromProvider: String,
+    val fromEmail: String,
+    val carriedCredits: Int,
+    val mergedAt: String,
+)
+
+/**
  * 대시보드 상단 KPI 카드. 전체 누적 + 최근 7일 비교 같은 단일 숫자 시리즈.
  * separation 은 클라이언트별 분해 포함 (mobile + plugin = total). render 는 모바일 전용.
  */

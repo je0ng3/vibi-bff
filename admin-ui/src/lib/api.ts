@@ -145,6 +145,30 @@ export interface AdminUserJobsResponse {
   total: number;
 }
 
+/**
+ * 계정에 연결된 로그인 수단 한 건. primary=최초 가입 provider, false=링크된 secondary.
+ * BFF 는 사용자 대면 GET /auth/identities 와 동일한 LinkedIdentity 를 그대로 재사용한다 (동일 JSON).
+ */
+export interface AdminLinkedIdentity {
+  provider: string;
+  email: string;
+  primary: boolean;
+}
+
+/** 이 계정으로 흡수된 병합 1건. carriedCredits=이월 크레딧(무료 보너스 제외분, 0 가능). */
+export interface AdminAccountMerge {
+  fromProvider: string;
+  fromEmail: string;
+  carriedCredits: number;
+  mergedAt: string;
+}
+
+/** 사용자 상세 페이지의 계정 연결/병합 정보. */
+export interface AdminUserAccount {
+  identities: AdminLinkedIdentity[];
+  merges: AdminAccountMerge[];
+}
+
 export interface AdminExternalCallDaily {
   date: string;
   provider: string;

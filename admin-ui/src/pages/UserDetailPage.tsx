@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { adminFetch, AdminAuthError, AdminUserJobsResponse } from "../lib/api";
+import {
+  adminFetch,
+  AdminAuthError,
+  AdminUserAccount,
+  AdminUserJobsResponse,
+} from "../lib/api";
 import { formatDurationMs, formatIsoDateTime } from "../lib/format";
+import { providerBadgeClass, providerLabel } from "../lib/providers";
 
 const PAGE_SIZE = 50;
 
@@ -12,6 +18,7 @@ export default function UserDetailPage() {
   const offset = Math.max(0, Number.parseInt(params.get("offset") ?? "0", 10) || 0);
 
   const [data, setData] = useState<AdminUserJobsResponse | null>(null);
+  const [account, setAccount] = useState<AdminUserAccount | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -32,6 +39,23 @@ export default function UserDetailPage() {
     return () => { cancelled = true; };
   }, [id, offset, navigate]);
 
+  // 계정 연결/병합 정보 — 페이지네이션(offset)과 무관하므로 별도 effect 로 한 번만 로드.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await adminFetch<AdminUserAccount>(`/api/v2/admin/users/${id}/account`);
+        if (!cancelled) setAccount(res);
+      } catch (e) {
+        if (cancelled) return;
+        if (e instanceof AdminAuthError) navigate("/login", { replace: true });
+        // 계정 정보 로드 실패는 잡 목록 표시를 막지 않는다 (best-effort 섹션).
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id, navigate]);
+
   if (!id) return null;
   if (error) return <p className="text-sm text-rose-600">{error}</p>;
   if (!data) return <p className="text-sm text-neutral-500">불러오는 중…</p>;
@@ -47,6 +71,8 @@ export default function UserDetailPage() {
         <h1 className="text-xl font-semibold">User · {id}</h1>
         <p className="text-sm text-neutral-500">Render 잡 + 영상 당 음원분리 사용 횟수. 최신순.</p>
       </header>
+
+      {account && <AccountSection account={account} />}
 
       {data.jobs.length === 0 ? (
         <p className="rounded-lg border border-dashed border-neutral-300 p-8 text-center text-sm text-neutral-500">
@@ -95,6 +121,72 @@ export default function UserDetailPage() {
         </nav>
       )}
     </div>
+  );
+}
+
+// 계정 연결 상태 + 병합 이력. 통합(병합) 안 한 계정은 연결 수단 1개 + 병합 이력 0건.
+function AccountSection({ account }: { account: AdminUserAccount }) {
+  const { identities, merges } = account;
+  return (
+    <section className="space-y-4 rounded-lg border border-neutral-200 bg-white p-4">
+      <div className="space-y-2">
+        <h2 className="text-sm font-semibold text-neutral-800">연결된 로그인 계정</h2>
+        {identities.length === 0 ? (
+          <p className="text-sm text-neutral-500">연결된 로그인 수단 정보가 없습니다.</p>
+        ) : (
+          <ul className="flex flex-wrap gap-2">
+            {identities.map((idn) => (
+              <li
+                key={`${idn.provider}:${idn.email}`}
+                className="flex items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-sm"
+              >
+                <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(idn.provider)}`}>
+                  {providerLabel(idn.provider)}
+                </span>
+                <span className="text-neutral-700">{idn.email}</span>
+                <span className="text-xs text-neutral-400">{idn.primary ? "primary" : "linked"}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {merges.length > 0 && (
+        <div className="space-y-2">
+          <h2 className="text-sm font-semibold text-neutral-800">병합 이력</h2>
+          <p className="text-xs text-neutral-500">이 계정으로 흡수된 다른 계정 + 이월된 크레딧.</p>
+          <div className="overflow-x-auto rounded border border-neutral-200">
+            <table className="min-w-full divide-y divide-neutral-200 text-sm">
+              <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
+                <tr>
+                  <th className="px-4 py-2">흡수된 계정</th>
+                  <th className="px-4 py-2 text-right">이월 크레딧</th>
+                  <th className="px-4 py-2">병합 시각</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-100">
+                {merges.map((m, i) => (
+                  <tr key={`${m.fromProvider}:${m.fromEmail}:${i}`} className="hover:bg-neutral-50">
+                    <td className="px-4 py-2">
+                      <span className="flex items-center gap-2">
+                        <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(m.fromProvider)}`}>
+                          {providerLabel(m.fromProvider)}
+                        </span>
+                        <span className="text-neutral-700">{m.fromEmail}</span>
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">
+                      {m.carriedCredits > 0 ? `+${m.carriedCredits}` : "0"}
+                    </td>
+                    <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(m.mergedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 

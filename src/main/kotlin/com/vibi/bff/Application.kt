@@ -107,7 +107,7 @@ fun Application.module() {
     val jobAnalyticsRepository = JobAnalyticsRepository()
     val externalApiCallsRepository = ExternalApiCallsRepository()
     val separationQueueRepository = SeparationQueueRepository()
-    val adminRepository = AdminRepository()
+    val adminRepository = AdminRepository(userRepository)
     val creditRepository = CreditRepository()
     val deviceCodeRepository = DeviceCodeRepository()
 

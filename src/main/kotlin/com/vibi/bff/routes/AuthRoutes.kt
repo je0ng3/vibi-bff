@@ -9,6 +9,7 @@ import com.vibi.bff.model.LinkedIdentity
 import com.vibi.bff.model.VerifiedIdentity
 import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.requireUser
+import com.vibi.bff.plugins.requireUserActiveIfPossible
 import com.vibi.bff.service.AccountContentEraser
 import com.vibi.bff.service.AuthService
 import com.vibi.bff.service.UserRepository
@@ -65,15 +66,18 @@ fun Route.authRoutes(
         // 계정이면 그 계정을 현재 계정으로 병합(크레딧 합산 — 무료 보너스 제외)한다.
         // /auth 하위라 RL_AUTH(IP 레이트리밋) 를 그대로 상속.
         route("/link") {
+            // requireUserActiveIfPossible = requireUser + users row 존재 확인. 삭제된 계정의
+            // 아직-유효한 JWT 로 링크 시도 시 user_identities FK 위반(500) 대신 401 account_deleted.
+            // jwtSecret 이 non-null 이라 반환은 항상 non-null (null 은 dev/test 무인증 분기 전용).
             post("/google") {
-                val principal = call.requireUser(jwtSecret)
+                val principal = call.requireUserActiveIfPossible(jwtSecret, userRepository)!!
                 val req = call.receive<GoogleAuthRequest>()
                 val identity = authService.verifyGoogleIdentity(req.idToken)
                 call.respondLink(userRepository, principal.userId, identity)
             }
 
             post("/apple") {
-                val principal = call.requireUser(jwtSecret)
+                val principal = call.requireUserActiveIfPossible(jwtSecret, userRepository)!!
                 val req = call.receive<AppleAuthRequest>()
                 val identity = authService.verifyAppleIdentity(req.idToken, req.fullName)
                 call.respondLink(userRepository, principal.userId, identity)
@@ -100,9 +104,10 @@ fun Route.authRoutes(
             }
         }
 
-        // 현재 계정에 연결된 provider 목록 (모바일 '계정 연결' 화면).
+        // 현재 계정에 연결된 provider 목록 (모바일 '계정 연결' 화면). 병합으로 흡수돼 사라진
+        // 계정의 JWT 로 조회하면 빈 목록을 silent 로 주는 대신 401 account_deleted 로 재로그인 유도.
         get("/identities") {
-            val principal = call.requireUser(jwtSecret)
+            val principal = call.requireUserActiveIfPossible(jwtSecret, userRepository)!!
             call.respond(HttpStatusCode.OK, IdentitiesResponse(currentIdentities(userRepository, principal.userId)))
         }
 

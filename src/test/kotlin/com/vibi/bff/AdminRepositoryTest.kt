@@ -44,7 +44,7 @@ class AdminRepositoryTest {
         )
         users = UserRepository()
         credits = CreditRepository()
-        admin = AdminRepository()
+        admin = AdminRepository(users)
     }
 
     @AfterTest
@@ -258,6 +258,79 @@ class AdminRepositoryTest {
             setOf("google", "apple"),
             all.first { it.userId == linked.id.toString() }.linkedProviders.toSet(),
         )
+    }
+
+    // ── getUserAccount (연결/병합) ───────────────────────────────────────────
+
+    @Test
+    fun `user account lists identities and is empty of merges for a solo account`() {
+        val solo = users.upsert(AuthProvider.GOOGLE, "g-solo", "solo@example.com", "Solo", null)
+
+        val account = admin.getUserAccount(solo.id)
+        assertEquals(1, account.identities.size)
+        assertEquals("google", account.identities.single().provider)
+        assertEquals("solo@example.com", account.identities.single().email)
+        assertEquals(true, account.identities.single().primary)
+        assertEquals(emptyList(), account.merges)
+    }
+
+    @Test
+    fun `merge does not re-point absorbed admob credits into the surviving account daily cap`() {
+        // 회귀 가드(#2): B 의 admob(보상형 광고) 획득분이 A 로 re-point 되면 A 의 일일 광고 상한에
+        // B 의 시청분이 잘못 합산돼 A 가 안 봤는데 cap_reached 로 막힌다. 병합은 admob row 를 제외해야.
+        allowAdminPlatformInH2()
+        val a = users.upsert(AuthProvider.GOOGLE, "g-a", "a@example.com", "Alice", null)
+        val b = users.upsert(AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
+        val now = Instant.now()
+        insertTxn(b.id, "admob", "ad-1", 1, now) // B 가 오늘 광고 1회 시청
+        insertTxn(b.id, "google", "buy-1", 50, now) // B 의 결제분 — 이건 A 로 re-point 되어야
+
+        users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
+
+        val since = now.minus(24, java.time.temporal.ChronoUnit.HOURS)
+        // admob 은 A 로 안 넘어옴 (B 삭제로 user_id NULL 익명화) → A 의 일일 광고 합 0.
+        assertEquals(0, credits.admobGrantedCreditsSince(a.id, since))
+        // 결제분(google)은 A 로 re-point 되어 감사 보존.
+        val buyOwner = transaction {
+            exec("SELECT user_id FROM credit_transactions WHERE transaction_id = 'buy-1'") { rs ->
+                rs.next(); rs.getObject(1) as UUID
+            }
+        }
+        assertEquals(a.id, buyOwner)
+    }
+
+    @Test
+    fun `user account surfaces merge history with absorbed account and carried credits`() {
+        // A (google): 무료 보너스만. B (apple): 무료 보너스 + 획득 5 → 병합 시 5 이월.
+        val a = users.upsert(AuthProvider.GOOGLE, "g-a", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = users.upsert(AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
+        credits.grantSignupBonus(b.id)
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5)
+
+        users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
+
+        val account = admin.getUserAccount(a.id)
+        // 병합 후 A 는 google(primary) + apple(secondary) 두 identity.
+        assertEquals(setOf("google", "apple"), account.identities.map { it.provider }.toSet())
+        // 병합 이력 1건 — 흡수된 apple 계정 + 이월 크레딧 5.
+        assertEquals(1, account.merges.size)
+        val merge = account.merges.single()
+        assertEquals("apple", merge.fromProvider)
+        assertEquals("b@icloud.com", merge.fromEmail)
+        assertEquals(5, merge.carriedCredits)
+    }
+
+    @Test
+    fun `users overview search treats underscore as a literal not a wildcard`() {
+        // 회귀 가드(#5): '_' 를 escape 안 하면 LIKE 가 single-char wildcard 로 처리해 오탐.
+        val exact = users.upsert(AuthProvider.GOOGLE, "g-1", "a_b@example.com", "Exact", null)
+        users.upsert(AuthProvider.GOOGLE, "g-2", "axb@example.com", "Decoy", null)
+
+        val (rows, _) = admin.getUsersOverview(50, 0, "a_b@example.com")
+        val emails = rows.map { it.email }.toSet()
+        assertEquals(setOf("a_b@example.com"), emails)
+        assertEquals(exact.id.toString(), rows.single().userId)
     }
 
     // ── getAdStats ─────────────────────────────────────────────────────────

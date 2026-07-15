@@ -2,6 +2,7 @@ package com.vibi.bff
 
 import com.vibi.bff.config.DbConfig
 import com.vibi.bff.db.AccountDeletionsTable
+import com.vibi.bff.db.AccountMergesTable
 import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.DbBootstrap
 import com.vibi.bff.db.UserIdentitiesTable
@@ -111,7 +112,7 @@ class UserRepositoryTest {
         assertEquals("apple", rows.single()[AccountDeletionsTable.provider])
 
         // 집계도 반영 — 누적/30일 모두 방금 탈퇴 1건.
-        val stats = AdminRepository().getDeletionStats()
+        val stats = AdminRepository(repo).getDeletionStats()
         assertEquals(1L, stats.totalDeletions)
         assertEquals(1L, stats.deletions30d)
     }
@@ -202,6 +203,46 @@ class UserRepositoryTest {
                 .single()[CreditTransactionsTable.userId]
         }
         assertEquals(a.id, txOwner)
+    }
+
+    @Test
+    fun `linkOrMerge writes an account_merges audit row for the absorbing account`() {
+        val credits = CreditRepository()
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "b@icloud.com", "Bob", null)
+        credits.grantSignupBonus(b.id)
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5)
+
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "b@icloud.com", "Bob", null)
+
+        val row = transaction {
+            AccountMergesTable.selectAll()
+                .where { AccountMergesTable.intoAccountId eq a.id }
+                .single()
+        }
+        assertEquals("apple", row[AccountMergesTable.fromProvider])
+        assertEquals("b@icloud.com", row[AccountMergesTable.fromEmail])
+        assertEquals(5, row[AccountMergesTable.carriedCredits])
+    }
+
+    @Test
+    fun `deleting the absorbing account cascades its merge audit rows away`() {
+        val credits = CreditRepository()
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "b@icloud.com", "Bob", null)
+        credits.grantSignupBonus(b.id)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "b@icloud.com", "Bob", null)
+
+        repo.delete(a.id)
+
+        val remaining = transaction {
+            AccountMergesTable.selectAll()
+                .where { AccountMergesTable.intoAccountId eq a.id }
+                .count()
+        }
+        assertEquals(0L, remaining)
     }
 
     @Test

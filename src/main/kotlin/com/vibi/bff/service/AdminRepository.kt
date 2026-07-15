@@ -1,10 +1,13 @@
 package com.vibi.bff.service
 
+import com.vibi.bff.db.AccountMergesTable
 import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
+import com.vibi.bff.model.AdminAccountMerge
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
 import com.vibi.bff.model.AdminDailyStats
+import com.vibi.bff.model.AdminUserAccount
 import com.vibi.bff.model.AdminDeletionDaily
 import com.vibi.bff.model.AdminDeletionStats
 import com.vibi.bff.model.AdminDurationBucket
@@ -20,6 +23,7 @@ import java.time.format.DateTimeFormatter
 import java.util.UUID
 import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.IntegerColumnType
+import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.UUIDColumnType
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
@@ -59,7 +63,10 @@ private fun medianOf(values: List<Long>): Double {
  * 모든 쿼리는 raw SQL — Exposed 의 group-by/aggregation API 로도 가능하나 raw 가 가독성 우위.
  * Postgres + H2 (PostgreSQL mode) 양쪽에서 동일 구문이 동작하는지 확인된 SQL 만 사용.
  */
-class AdminRepository {
+class AdminRepository(
+    /** identity 조립을 사용자 대면 경로와 공유하기 위한 의존성 ([getUserAccount] 만 사용). */
+    private val userRepository: UserRepository,
+) {
 
     /**
      * 지정 기간 [fromInclusive, toExclusive) 의 일별 render/separation 카운트 + 누적 입력 길이.
@@ -134,7 +141,17 @@ class AdminRepository {
         }
 
         val q = query?.trim()?.takeIf { it.isNotEmpty() }
-        val likePattern = q?.let { "%${it.lowercase().replace("%", "\\%")}%" }
+        // LIKE 와일드카드(%, _)와 escape 문자(\) 를 모두 escape — 안 하면 'a_b@x.com' 검색이
+        // '_' 를 single-char wildcard 로 처리해 'axb@x.com' 같은 오탐을 낸다 (잘못된 계정 row →
+        // 오조작 role 변경 위험). backslash 를 먼저 escape 해야 뒤 치환이 중복 escape 되지 않는다.
+        // Postgres·H2 모두 LIKE default escape 가 backslash 라 별도 ESCAPE 절 불필요.
+        val likePattern = q?.let {
+            val escaped = it.lowercase()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            "%$escaped%"
+        }
         val conditions = mutableListOf<String>()
         if (q != null) conditions += "(LOWER(u.email) LIKE ? OR LOWER(u.name) LIKE ?)"
         when (client) {
@@ -533,6 +550,37 @@ class AdminRepository {
             }
         }
         rows to total
+    }
+
+    /**
+     * 사용자 상세 페이지용 — 계정에 연결된 로그인 수단 + 이 계정으로 흡수된 병합 이력.
+     *
+     * identities: [UserRepository.listIdentities] 재사용 (users primary + user_identities secondary).
+     *   사용자 대면 GET /auth/identities 와 단일 소스라 조립 로직이 어긋나지 않는다. 없는 userId 는 빈 리스트.
+     * merges: account_merges 에서 into_account_id = userId (최신순). 병합이 없었으면 빈 리스트.
+     */
+    fun getUserAccount(userId: UUID): AdminUserAccount = transaction {
+        val identities = userRepository.listIdentities(userId)
+
+        val merges = AccountMergesTable
+            .select(
+                AccountMergesTable.fromProvider,
+                AccountMergesTable.fromEmail,
+                AccountMergesTable.carriedCredits,
+                AccountMergesTable.mergedAt,
+            )
+            .where { AccountMergesTable.intoAccountId eq userId }
+            .orderBy(AccountMergesTable.mergedAt, SortOrder.DESC)
+            .map {
+                AdminAccountMerge(
+                    fromProvider = it[AccountMergesTable.fromProvider],
+                    fromEmail = it[AccountMergesTable.fromEmail],
+                    carriedCredits = it[AccountMergesTable.carriedCredits],
+                    mergedAt = DateTimeFormatter.ISO_INSTANT.format(it[AccountMergesTable.mergedAt]),
+                )
+            }
+
+        AdminUserAccount(identities = identities, merges = merges)
     }
 
     /**
