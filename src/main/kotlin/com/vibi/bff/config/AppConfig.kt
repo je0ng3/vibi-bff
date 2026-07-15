@@ -289,6 +289,17 @@ data class DbConfig(
                 "DATABASE_URL must enforce TLS for Postgres — add sslmode=require " +
                     "(or verify-ca/verify-full). sslmode=disable is rejected."
             }
+            // 자격증명은 분리 env(DB_USER/DB_PASSWORD) 또는 URL 쿼리파라미터(?user=&password=)
+            // 둘 중 하나로 반드시 존재해야 한다. 둘 다 비면 부팅은 성공하지만 첫 쿼리부터
+            // 인증 실패로 모든 DB endpoint 가 500 — deploy 는 green 인데 서비스만 죽는
+            // silent failure 를 boot 시점에 fail-fast 로 차단. (pgjdbc 는 userinfo 미지원이라
+            // URL 내장은 반드시 쿼리파라미터 형식.)
+            val inlineCreds = Regex("[?&]user=").containsMatchIn(jdbcUrl) &&
+                Regex("[?&]password=").containsMatchIn(jdbcUrl)
+            require(inlineCreds || (user.isNotBlank() && password.isNotBlank())) {
+                "DB credentials missing — set DB_USER/DB_PASSWORD env or embed " +
+                    "?user=&password= in DATABASE_URL (pgjdbc query-param form)."
+            }
         }
         require(maxPoolSize in 1..50) { "DB_MAX_POOL must be in 1..50 (got $maxPoolSize)" }
     }
