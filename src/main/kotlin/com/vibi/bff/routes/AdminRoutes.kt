@@ -149,6 +149,20 @@ fun Route.adminRoutes(
             call.respond(HttpStatusCode.OK, AdminUserJobsResponse(jobs = rows, total = total))
         }
 
+        // 사용자별 계정 연결/병합 정보 — 연결된 로그인 수단 + 이 계정으로 흡수된 병합 이력(이월 크레딧).
+        get("/users/{userId}/account") {
+            call.requireAdmin(jwtSecret)
+            val userIdParam = call.parameters["userId"]
+                ?: throw NotFoundException("userId required")
+            val userId = try {
+                UUID.fromString(userIdParam)
+            } catch (e: IllegalArgumentException) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
+            }
+            val data = withContext(Dispatchers.IO) { adminRepository.getUserAccount(userId) }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
         // 사용자 role 승격/강등 — 유일한 mutating admin 액션. body {role: 'admin'|'user'}.
         // 자기 자신 role 변경은 차단 (마지막 운영자 자가 강등에 의한 lockout 방지 + 오조작 방어).
         // JWT 는 발급 시점 role 을 쓰므로 대상 사용자는 재로그인 후 반영 (AdminRepository.setUserRole 참조).

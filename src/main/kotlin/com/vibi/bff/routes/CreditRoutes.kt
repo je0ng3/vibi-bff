@@ -10,8 +10,10 @@ import com.vibi.bff.model.CreditPurchaseResponse
 import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.plugins.requireUser
+import com.vibi.bff.plugins.requireUserActiveIfPossible
 import com.vibi.bff.service.CreditCost
 import com.vibi.bff.service.CreditRepository
+import com.vibi.bff.service.UserRepository
 import com.vibi.bff.service.iap.AdMobSsvVerifier
 import com.vibi.bff.service.iap.AppleReceiptVerifier
 import com.vibi.bff.service.iap.GoogleReceiptVerifier
@@ -48,6 +50,7 @@ private val log = LoggerFactory.getLogger("com.vibi.bff.routes.CreditRoutes")
  */
 fun Route.creditRoutes(
     creditRepository: CreditRepository,
+    userRepository: UserRepository,
     appleVerifier: AppleReceiptVerifier?,
     googleVerifier: GoogleReceiptVerifier?,
     adMobVerifier: AdMobSsvVerifier?,
@@ -56,7 +59,9 @@ fun Route.creditRoutes(
 ) {
     route("/credits") {
         get {
-            val principal = call.requireUser(jwtSecret)
+            // 병합으로 흡수돼 사라진 계정(user_credits 는 CASCADE 삭제됨)의 JWT 로 조회하면 잔액 0 을
+            // silent 로 주는 대신 401 account_deleted 로 재로그인 유도. exists 는 PK 단일 lookup.
+            val principal = call.requireUserActiveIfPossible(jwtSecret, userRepository)!!
             val balance = withContext(Dispatchers.IO) { creditRepository.balance(principal.userId) }
             call.respond(CreditBalanceResponse(balance = balance))
         }

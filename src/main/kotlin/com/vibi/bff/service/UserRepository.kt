@@ -1,6 +1,7 @@
 package com.vibi.bff.service
 
 import com.vibi.bff.db.AccountDeletionsTable
+import com.vibi.bff.db.AccountMergesTable
 import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.RenderJobsTable
 import com.vibi.bff.db.SeparationJobsTable
@@ -12,6 +13,7 @@ import com.vibi.bff.model.LinkedIdentity
 import java.time.Instant
 import java.util.UUID
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
@@ -228,8 +230,9 @@ class UserRepository {
      * credit_ledger(kind='signup')에 있어 애초에 안 잡힌다. 이월액 = min(B.balance, B_earned)
      * (이미 쓴 만큼은 못 넘기고, 남은 잔액은 유료분으로 간주해 사용자에게 유리하게).
      *
-     * 잡(render/separation) 과 결제 이력(credit_transactions) 의 user_id 는 A 로 re-point 해
-     * 보존한다 (B 삭제 전에 옮겨야 FK `ON DELETE SET NULL` 로 유실되지 않는다).
+     * 잡(render/separation) 과 결제 이력(credit_transactions, **admob 제외**) 의 user_id 는 A 로
+     * re-point 해 보존한다 (B 삭제 전에 옮겨야 FK `ON DELETE SET NULL` 로 유실되지 않는다). admob
+     * 획득분만 제외 — A 의 일일 광고 상한에 B 의 시청분이 잘못 합산되지 않도록 (아래 참조).
      *
      * **credit_ledger(signup/consume/refund) 는 re-point 하지 않는다** — B 삭제 시 SET NULL 로
      * 익명화된다. 이유:
@@ -242,6 +245,9 @@ class UserRepository {
      *
      * B 의 identity(primary + secondary) 는 A 의 secondary 로 편입 후 B users row 삭제
      * (user_credits(B) 는 `ON DELETE CASCADE` 로 정리).
+     *
+     * 병합 시점에 [AccountMergesTable] 에 감사 1 row (into=A, from B 의 provider/email, carry) 를
+     * 적재한다 — 관리자 상세 페이지가 "무슨 계정이 합쳐졌고 몇 크레딧 이월됐나" 를 보여줄 소스.
      *
      * @return (이월된 크레딧, 병합 후 A 의 잔액).
      */
@@ -258,7 +264,12 @@ class UserRepository {
 
         // 잡·결제 이력 re-point (B 삭제로 SET NULL 되기 전에). credit_ledger 는 의도적으로 제외 —
         // 위 KDoc 참조 (예약분 환불로 무료 보너스가 되살아나는 것 차단 + ledger/balance 정합).
-        CreditTransactionsTable.update({ CreditTransactionsTable.userId eq from }) { it[CreditTransactionsTable.userId] = into }
+        // admob(보상형 광고) 획득분도 제외 — re-point 하면 B 의 최근 24h 광고 시청분이 A 의
+        // admobGrantedCreditsSince 합에 잡혀 A 의 일일 광고 상한이 잘못 소진된다(A 는 안 봤는데
+        // cap_reached). 제외분은 B 삭제 시 SET NULL 로 익명화 (getAdStats 의 총계엔 그대로 남음).
+        CreditTransactionsTable.update({
+            (CreditTransactionsTable.userId eq from) and (CreditTransactionsTable.platform neq "admob")
+        }) { it[CreditTransactionsTable.userId] = into }
         RenderJobsTable.update({ RenderJobsTable.userId eq from }) { it[RenderJobsTable.userId] = into }
         SeparationJobsTable.update({ SeparationJobsTable.userId eq from }) { it[SeparationJobsTable.userId] = into }
 
@@ -277,6 +288,17 @@ class UserRepository {
             it[UserIdentitiesTable.name] = b[UsersTable.name]
             it[UserIdentitiesTable.picture] = b[UsersTable.picture]
             it[UserIdentitiesTable.createdAt] = now
+        }
+
+        // 병합 감사 row — 관리자 상세 페이지가 "무슨 계정이·언제 합쳐졌고 몇 크레딧 이월됐나" 를
+        // 보여줄 유일한 소스 (carry 는 balance 에만 반영되지 B 삭제 후엔 어디서도 재구성 불가).
+        // into 삭제 시 CASCADE 로 함께 정리되므로 B 삭제 전 아무 시점에나 insert 하면 된다.
+        AccountMergesTable.insert {
+            it[AccountMergesTable.intoAccountId] = into
+            it[AccountMergesTable.fromProvider] = b[UsersTable.provider]
+            it[AccountMergesTable.fromEmail] = b[UsersTable.email]
+            it[AccountMergesTable.carriedCredits] = carry
+            it[AccountMergesTable.mergedAt] = now
         }
 
         UsersTable.deleteWhere { UsersTable.id eq from }

@@ -122,6 +122,7 @@ fun Application.configureRouting(
             )
             creditRoutes(
                 creditRepository,
+                userRepository = userRepository,
                 appleVerifier = appleReceiptVerifier,
                 googleVerifier = googleReceiptVerifier,
                 adMobVerifier = adMobSsvVerifier,
