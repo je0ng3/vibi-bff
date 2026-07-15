@@ -329,31 +329,34 @@ class CreditRepository {
         PurchaseOutcome(granted = credits, balance = readBalance(userId))
     }
 
-    /**
-     * user_credits row 가 없으면 [credits] 로 새로 만들고, 있으면 더한다. updated_at 도 갱신.
-     * grantPurchase / grantSignupBonus / refund 가 공유.
-     */
-    private fun addToBalance(userId: UUID, credits: Int, now: Instant) {
-        UserCreditsTable.upsert(
-            UserCreditsTable.userId,
-            onUpdate = {
-                with(SqlExpressionBuilder) {
-                    it[UserCreditsTable.balance] = UserCreditsTable.balance + credits
-                }
-                it[UserCreditsTable.updatedAt] = now
-            },
-        ) {
-            it[UserCreditsTable.userId] = userId
-            it[UserCreditsTable.balance] = credits
-            it[UserCreditsTable.updatedAt] = now
-        }
-    }
-
-    private fun readBalance(userId: UUID): Int =
-        UserCreditsTable
-            .select(UserCreditsTable.balance)
-            .where { UserCreditsTable.userId eq userId }
-            .singleOrNull()
-            ?.get(UserCreditsTable.balance)
-            ?: 0
 }
+
+/**
+ * user_credits row 가 없으면 [credits] 로 새로 만들고, 있으면 더한다. updated_at 도 갱신.
+ * grantPurchase / grantSignupBonus / refund + [com.vibi.bff.service.UserRepository.mergeAccounts]
+ * 가 공유하는 단일 balance-mutation 프리미티브. 반드시 열린 Exposed 트랜잭션 안에서 호출.
+ */
+internal fun addToBalance(userId: UUID, credits: Int, now: Instant) {
+    UserCreditsTable.upsert(
+        UserCreditsTable.userId,
+        onUpdate = {
+            with(SqlExpressionBuilder) {
+                it[UserCreditsTable.balance] = UserCreditsTable.balance + credits
+            }
+            it[UserCreditsTable.updatedAt] = now
+        },
+    ) {
+        it[UserCreditsTable.userId] = userId
+        it[UserCreditsTable.balance] = credits
+        it[UserCreditsTable.updatedAt] = now
+    }
+}
+
+/** user_credits 잔액 조회 — row 없으면 0. 열린 트랜잭션 안에서 호출. */
+internal fun readBalance(userId: UUID): Int =
+    UserCreditsTable
+        .select(UserCreditsTable.balance)
+        .where { UserCreditsTable.userId eq userId }
+        .singleOrNull()
+        ?.get(UserCreditsTable.balance)
+        ?: 0

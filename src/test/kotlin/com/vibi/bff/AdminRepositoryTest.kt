@@ -243,6 +243,23 @@ class AdminRepositoryTest {
         assertEquals("m@example.com", mobileRows.single().email)
     }
 
+    @Test
+    fun `users overview lists linked providers primary and secondary`() {
+        val solo = users.upsert(AuthProvider.GOOGLE, "g-solo", "solo@example.com", "Solo", null)
+        val linked = users.upsert(AuthProvider.GOOGLE, "g-link", "link@example.com", "Linked", null)
+        // 두 번째 provider 연결 → 이 계정은 google(primary) + apple(secondary).
+        users.linkOrMerge(linked.id, AuthProvider.APPLE, "ap-link", "link@icloud.com", "Linked", null)
+
+        val (all, _) = admin.getUsersOverview(50, 0, null)
+        // 통합 안 한 계정은 provider 1개.
+        assertEquals(listOf("google"), all.first { it.userId == solo.id.toString() }.linkedProviders)
+        // 통합한 계정은 primary + secondary 둘 다.
+        assertEquals(
+            setOf("google", "apple"),
+            all.first { it.userId == linked.id.toString() }.linkedProviders.toSet(),
+        )
+    }
+
     // ── getAdStats ─────────────────────────────────────────────────────────
 
     @Test

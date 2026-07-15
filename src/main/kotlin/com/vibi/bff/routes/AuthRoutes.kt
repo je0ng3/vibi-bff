@@ -1,16 +1,24 @@
 package com.vibi.bff.routes
 
 import com.vibi.bff.model.AppleAuthRequest
+import com.vibi.bff.model.AuthProvider
 import com.vibi.bff.model.GoogleAuthRequest
+import com.vibi.bff.model.IdentitiesResponse
+import com.vibi.bff.model.LinkResponse
+import com.vibi.bff.model.LinkedIdentity
+import com.vibi.bff.model.VerifiedIdentity
+import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.requireUser
 import com.vibi.bff.service.AccountContentEraser
 import com.vibi.bff.service.AuthService
 import com.vibi.bff.service.UserRepository
 import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.delete
+import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +60,52 @@ fun Route.authRoutes(
             call.respond(HttpStatusCode.OK, response)
         }
 
+        // ── 계정 통합(링크) ─────────────────────────────────────────────────────
+        // 로그인된 사용자가 두 번째 provider 를 자기 계정에 연결. 대상 provider 가 이미 독립
+        // 계정이면 그 계정을 현재 계정으로 병합(크레딧 합산 — 무료 보너스 제외)한다.
+        // /auth 하위라 RL_AUTH(IP 레이트리밋) 를 그대로 상속.
+        route("/link") {
+            post("/google") {
+                val principal = call.requireUser(jwtSecret)
+                val req = call.receive<GoogleAuthRequest>()
+                val identity = authService.verifyGoogleIdentity(req.idToken)
+                call.respondLink(userRepository, principal.userId, identity)
+            }
+
+            post("/apple") {
+                val principal = call.requireUser(jwtSecret)
+                val req = call.receive<AppleAuthRequest>()
+                val identity = authService.verifyAppleIdentity(req.idToken, req.fullName)
+                call.respondLink(userRepository, principal.userId, identity)
+            }
+        }
+
+        // provider identity 해제. 마지막 하나는 남겨야 하며(로그인 수단 유실 방지), primary
+        // 를 해제하면 남은 secondary 를 primary 로 승격한다 — 계정 UUID/크레딧은 유지.
+        delete("/link/{provider}") {
+            val principal = call.requireUser(jwtSecret)
+            val provider = parseProvider(call.parameters["provider"])
+            val outcome = withContext(Dispatchers.IO) {
+                userRepository.unlinkIdentity(principal.userId, provider)
+            }
+            when (outcome) {
+                UserRepository.UnlinkOutcome.CannotUnlinkLast ->
+                    throw ApiErrorException(HttpStatusCode.Conflict, "cannot_unlink_last_identity")
+                UserRepository.UnlinkOutcome.NotFound ->
+                    throw ApiErrorException(HttpStatusCode.NotFound, "identity_not_linked")
+                UserRepository.UnlinkOutcome.Unlinked -> {
+                    log.info("identity unlinked: user={} provider={}", principal.userId, provider.dbValue)
+                    call.respond(HttpStatusCode.OK, IdentitiesResponse(currentIdentities(userRepository, principal.userId)))
+                }
+            }
+        }
+
+        // 현재 계정에 연결된 provider 목록 (모바일 '계정 연결' 화면).
+        get("/identities") {
+            val principal = call.requireUser(jwtSecret)
+            call.respond(HttpStatusCode.OK, IdentitiesResponse(currentIdentities(userRepository, principal.userId)))
+        }
+
         delete("/account") {
             val principal = call.requireUser(jwtSecret)
             // GDPR 17조 / CCPA right-to-erasure: users row 삭제 BEFORE 에 사용자 콘텐츠(분리 스템·
@@ -70,4 +124,54 @@ fun Route.authRoutes(
             call.respond(HttpStatusCode.NoContent)
         }
     }
+}
+
+/** "google"/"apple" (대소문자 무시) → [AuthProvider]. 그 외는 400. 매핑은 enum 이 소유. */
+private fun parseProvider(raw: String?): AuthProvider =
+    AuthProvider.fromDbValue(raw)
+        ?: throw ApiErrorException(HttpStatusCode.BadRequest, "unsupported_provider")
+
+private suspend fun currentIdentities(
+    userRepository: UserRepository,
+    accountId: java.util.UUID,
+): List<LinkedIdentity> = withContext(Dispatchers.IO) {
+    userRepository.listIdentities(accountId)
+}
+
+/**
+ * [UserRepository.linkOrMerge] 실행 후 결과를 HTTP 로 매핑.
+ * 같은 provider 중복은 409, 그 외는 200 + 갱신된 identity 목록 (+병합 시 이월 크레딧·잔액).
+ */
+private suspend fun ApplicationCall.respondLink(
+    userRepository: UserRepository,
+    accountId: java.util.UUID,
+    identity: VerifiedIdentity,
+) {
+    val outcome = withContext(Dispatchers.IO) {
+        userRepository.linkOrMerge(
+            currentAccountId = accountId,
+            provider = identity.provider,
+            providerSub = identity.providerSub,
+            email = identity.email,
+            name = identity.name,
+            picture = identity.picture,
+        )
+    }
+    val identities = currentIdentities(userRepository, accountId)
+    val response = when (outcome) {
+        UserRepository.LinkOutcome.AlreadyLinked ->
+            LinkResponse(status = "already_linked", identities = identities)
+        UserRepository.LinkOutcome.Linked ->
+            LinkResponse(status = "linked", identities = identities)
+        is UserRepository.LinkOutcome.Merged ->
+            LinkResponse(
+                status = "merged",
+                creditBalance = outcome.newBalance,
+                mergedCredits = outcome.carriedCredits,
+                identities = identities,
+            )
+        UserRepository.LinkOutcome.ProviderConflict ->
+            throw ApiErrorException(HttpStatusCode.Conflict, "provider_already_linked")
+    }
+    respond(HttpStatusCode.OK, response)
 }

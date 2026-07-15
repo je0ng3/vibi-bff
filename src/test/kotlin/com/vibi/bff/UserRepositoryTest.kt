@@ -2,10 +2,14 @@ package com.vibi.bff
 
 import com.vibi.bff.config.DbConfig
 import com.vibi.bff.db.AccountDeletionsTable
+import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.DbBootstrap
+import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AuthProvider
 import com.vibi.bff.service.AdminRepository
+import com.vibi.bff.service.CreditRepository
+import com.vibi.bff.service.SIGNUP_BONUS_CREDITS
 import com.vibi.bff.service.UserRepository
 import com.zaxxer.hikari.HikariDataSource
 import java.util.UUID
@@ -15,6 +19,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -116,5 +121,201 @@ class UserRepositoryTest {
         repo.delete(UUID.randomUUID())
         val count = transaction { AccountDeletionsTable.selectAll().count() }
         assertEquals(0L, count)
+    }
+
+    // ── 계정 통합 (linking / merge) ────────────────────────────────────────────
+
+    @Test
+    fun `resolveOrCreate resolves a linked secondary identity to the existing account`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+
+        // Apple identity 로 재로그인 → 새 계정을 만들지 않고 A 로 resolve (isNewUser=false).
+        val resolved = repo.resolveOrCreate(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        assertEquals(a.id, resolved.id)
+        assertFalse(resolved.isNewUser)
+        // users 테이블엔 여전히 A 한 row 뿐 (apple 이 spurious 계정을 만들지 않음).
+        val userCount = transaction { UsersTable.selectAll().count() }
+        assertEquals(1L, userCount)
+    }
+
+    @Test
+    fun `linkOrMerge links a fresh identity as secondary`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        assertEquals(UserRepository.LinkOutcome.Linked, outcome)
+
+        val identities = repo.listIdentities(a.id)
+        assertEquals(2, identities.size)
+        assertEquals(setOf("google", "apple"), identities.map { it.provider }.toSet())
+        assertEquals(1, identities.count { it.primary })
+    }
+
+    @Test
+    fun `linkOrMerge is idempotent when identity already linked`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        val again = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        assertEquals(UserRepository.LinkOutcome.AlreadyLinked, again)
+        assertEquals(2, repo.listIdentities(a.id).size)
+    }
+
+    @Test
+    fun `linkOrMerge rejects a second identity of the same provider`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        // 다른 google sub 를 링크 시도 → 계정당 provider 1개라 거부.
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.GOOGLE, "g-2", "other@example.com", "Alice2", null)
+        assertEquals(UserRepository.LinkOutcome.ProviderConflict, outcome)
+        assertEquals(1, repo.listIdentities(a.id).size)
+    }
+
+    @Test
+    fun `linkOrMerge merges another account carrying only earned credits not the free bonus`() {
+        val credits = CreditRepository()
+        // A (google): 무료 보너스만.
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        // B (apple): 무료 보너스 + 획득 크레딧 5 (credit_transactions 1 row). 병합 합산은 platform
+        // 무관하게 credit_transactions 를 SUM 하므로, H2 CHECK 가 허용하는 'google' 로 획득분 표현
+        // (실제 광고 경로는 platform='admob' — prod Postgres 에선 동일하게 SUM 에 잡힘).
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id)
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5)
+        assertEquals(SIGNUP_BONUS_CREDITS + 5, credits.balance(b.id))
+
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        // 무료 보너스(10)는 중복 이월 안 됨 — 획득분(5)만 합산.
+        assertTrue(outcome is UserRepository.LinkOutcome.Merged)
+        val merged = outcome as UserRepository.LinkOutcome.Merged
+        assertEquals(5, merged.carriedCredits)
+        assertEquals(SIGNUP_BONUS_CREDITS + 5, merged.newBalance)
+        assertEquals(SIGNUP_BONUS_CREDITS + 5, credits.balance(a.id))
+
+        // B 계정 소멸, 두 identity 모두 A 로.
+        assertFalse(repo.exists(b.id))
+        assertEquals(setOf("google", "apple"), repo.listIdentities(a.id).map { it.provider }.toSet())
+        // B 의 결제 이력이 A 로 re-point (감사 보존).
+        val txOwner = transaction {
+            CreditTransactionsTable
+                .select(CreditTransactionsTable.userId)
+                .where { CreditTransactionsTable.transactionId eq "earn-1" }
+                .single()[CreditTransactionsTable.userId]
+        }
+        assertEquals(a.id, txOwner)
+    }
+
+    @Test
+    fun `linkOrMerge caps carried credits at remaining balance when earned credits already spent`() {
+        val credits = CreditRepository()
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id) // +10 free
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned → balance 15
+        credits.reserve(b.id, "job-1", 12) // -12 → balance 3, earned(credit_transactions) 여전히 5
+
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null) as UserRepository.LinkOutcome.Merged
+        // carry = min(balance=3, earned=5) = 3.
+        assertEquals(3, outcome.carriedCredits)
+        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id))
+    }
+
+    @Test
+    fun `merging an account with an in-flight job does not refund the reserve into the absorbing account`() {
+        // 회귀 가드: 병합이 B 의 consume ledger row 를 A 로 re-point 하면, 잡 실패 시 예약분 전액이
+        // A 로 환불돼 min(balance, earned) 캡을 우회(무료 보너스 되살아남). 병합은 credit_ledger 를
+        // re-point 하지 않으므로 orphan 된 consume 의 환불은 no-op 여야 한다.
+        val credits = CreditRepository()
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id) // A balance = 10
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id) // +10 free
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned → balance 15
+        credits.reserve(b.id, "job-1", 12) // in-flight 잡: -12 → balance 3
+
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null) // carry=min(3,5)=3
+        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id)) // 13
+
+        // 병합 후 B 의 잡이 실패 → 환불 콜백. orphan 된 consume 라 A 잔액은 변하지 않아야 한다.
+        val refunded = credits.refund("job-1")
+        assertNull(refunded) // consume.user_id 가 NULL → refund no-op
+        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id)) // 여전히 13 (25 아님 = 누수 없음)
+    }
+
+    @Test
+    fun `linkOrMerge rejects merge when both accounts share a provider`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null) // A = {google, apple}
+        val b = repo.upsert(AuthProvider.APPLE, "ap-2", "b@icloud.com", "Bob", null)       // B = {apple}
+
+        // B 의 apple 을 A 에 링크 시도 → A 도 apple 보유 → 병합 불가.
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-2", "b@icloud.com", "Bob", null)
+        assertEquals(UserRepository.LinkOutcome.ProviderConflict, outcome)
+        assertTrue(repo.exists(b.id)) // B 그대로.
+    }
+
+    @Test
+    fun `unlink secondary identity removes it and keeps account`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+
+        val outcome = repo.unlinkIdentity(a.id, AuthProvider.APPLE)
+        assertEquals(UserRepository.UnlinkOutcome.Unlinked, outcome)
+        val identities = repo.listIdentities(a.id)
+        assertEquals(1, identities.size)
+        assertEquals("google", identities.single().provider)
+        assertTrue(identities.single().primary)
+    }
+
+    @Test
+    fun `unlink primary identity promotes a secondary to primary`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+
+        val outcome = repo.unlinkIdentity(a.id, AuthProvider.GOOGLE)
+        assertEquals(UserRepository.UnlinkOutcome.Unlinked, outcome)
+        // apple 이 primary 로 승격, 같은 계정 UUID 유지.
+        val identities = repo.listIdentities(a.id)
+        assertEquals(1, identities.size)
+        assertEquals("apple", identities.single().provider)
+        assertTrue(identities.single().primary)
+        // users row 의 primary provider 도 apple 로 갱신, secondary row 는 사라짐.
+        val (provider, secondaryCount) = transaction {
+            val p = UsersTable.select(UsersTable.provider).where { UsersTable.id eq a.id }.single()[UsersTable.provider]
+            val c = UserIdentitiesTable.selectAll().where { UserIdentitiesTable.accountId eq a.id }.count()
+            p to c
+        }
+        assertEquals("apple", provider)
+        assertEquals(0L, secondaryCount)
+    }
+
+    @Test
+    fun `unlink last remaining identity is rejected`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        val outcome = repo.unlinkIdentity(a.id, AuthProvider.GOOGLE)
+        assertEquals(UserRepository.UnlinkOutcome.CannotUnlinkLast, outcome)
+        assertTrue(repo.exists(a.id))
+    }
+
+    @Test
+    fun `unlink a provider that is not linked returns NotFound not CannotUnlinkLast`() {
+        // google 만 있는 계정에 apple 해제 요청 → apple 은 안 붙어 있으므로 NotFound.
+        // (last-identity 가드가 먼저 발동해 CannotUnlinkLast 로 잘못 매핑되면 안 됨.)
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        assertEquals(UserRepository.UnlinkOutcome.NotFound, repo.unlinkIdentity(a.id, AuthProvider.APPLE))
+        assertTrue(repo.exists(a.id))
+    }
+
+    @Test
+    fun `unlink drops to single identity then further unlink is rejected as last`() {
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        // apple 제거 → google primary 하나만 남음.
+        assertEquals(UserRepository.UnlinkOutcome.Unlinked, repo.unlinkIdentity(a.id, AuthProvider.APPLE))
+        // 남은 마지막(google) 언링크는 거부 — 계정엔 최소 1개 로그인 수단 유지.
+        assertEquals(UserRepository.UnlinkOutcome.CannotUnlinkLast, repo.unlinkIdentity(a.id, AuthProvider.GOOGLE))
+        assertNull(transaction {
+            UserIdentitiesTable.selectAll().where { UserIdentitiesTable.accountId eq a.id }.firstOrNull()
+        })
     }
 }

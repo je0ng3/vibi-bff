@@ -12,6 +12,7 @@ import com.vibi.bff.model.AuthProvider
 import com.vibi.bff.model.AuthResponse
 import com.vibi.bff.model.AuthUser
 import com.vibi.bff.model.GoogleTokenInfo
+import com.vibi.bff.model.VerifiedIdentity
 import com.vibi.bff.plugins.ApiErrorException
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
@@ -63,7 +64,14 @@ class AuthService(
             .build()
     }
 
-    suspend fun verifyGoogleIdToken(idToken: String): AuthUser {
+    suspend fun verifyGoogleIdToken(idToken: String): AuthUser =
+        completeSignIn(verifyGoogleIdentity(idToken))
+
+    /**
+     * Google ID Token 검증만 수행 (DB upsert 없음) — 로그인([verifyGoogleIdToken])과 계정
+     * 통합(링크) 경로가 공유. 검증 통과 시 [VerifiedIdentity] 반환.
+     */
+    suspend fun verifyGoogleIdentity(idToken: String): VerifiedIdentity {
         if (idToken.isBlank()) {
             throw ApiErrorException(HttpStatusCode.BadRequest, "missing_id_token")
         }
@@ -98,7 +106,7 @@ class AuthService(
             throw ApiErrorException(HttpStatusCode.Unauthorized, "google_email_unverified")
         }
 
-        return completeSignIn(
+        return VerifiedIdentity(
             provider = AuthProvider.GOOGLE,
             providerSub = info.sub,
             email = info.email,
@@ -113,7 +121,14 @@ class AuthService(
      * @param fullName Apple 의 최초-1회 fullName. 신규 가입 시에만 user.name 으로 사용 —
      *   재로그인 시 null 이 정상이고, 기존 row 의 name 은 보존된다.
      */
-    suspend fun verifyAppleIdToken(idToken: String, fullName: String?): AuthUser {
+    suspend fun verifyAppleIdToken(idToken: String, fullName: String?): AuthUser =
+        completeSignIn(verifyAppleIdentity(idToken, fullName))
+
+    /**
+     * Apple ID Token 검증만 수행 (DB upsert 없음) — 로그인([verifyAppleIdToken])과 계정 통합(링크)
+     * 경로가 공유. 검증 통과 시 [VerifiedIdentity] 반환.
+     */
+    suspend fun verifyAppleIdentity(idToken: String, fullName: String?): VerifiedIdentity {
         if (idToken.isBlank()) {
             throw ApiErrorException(HttpStatusCode.BadRequest, "missing_id_token")
         }
@@ -159,7 +174,7 @@ class AuthService(
             throw ApiErrorException(HttpStatusCode.Unauthorized, "apple_email_unverified")
         }
 
-        return completeSignIn(
+        return VerifiedIdentity(
             provider = AuthProvider.APPLE,
             providerSub = sub,
             email = email,
@@ -192,15 +207,14 @@ class AuthService(
             }
         }
 
-    private suspend fun completeSignIn(
-        provider: AuthProvider,
-        providerSub: String,
-        email: String,
-        name: String,
-        picture: String?,
-    ): AuthUser {
+    private suspend fun completeSignIn(identity: VerifiedIdentity): AuthUser {
+        val email = identity.email
+        val name = identity.name
+        val picture = identity.picture
+        // resolveOrCreate — 링크된 secondary identity 로 로그인 시 spurious 신규 계정을 만들지
+        // 않고 기존 계정으로 resolve. 신규 가입만 isNewUser=true 로 보너스 분기.
         val upserted = withContext(Dispatchers.IO) {
-            userRepository.upsert(provider, providerSub, email, name, picture)
+            userRepository.resolveOrCreate(identity.provider, identity.providerSub, email, name, picture)
         }
         // 신규 가입 보너스 — isNewUser 가 false-negative 일 수 있는 동시 가입 race 도
         // grantSignupBonus 자체가 (platform='signup', txId='signup-<userId>') UNIQUE 로

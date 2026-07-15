@@ -1,5 +1,6 @@
 package com.vibi.bff.service
 
+import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
@@ -162,9 +163,11 @@ class AdminRepository {
         val total: Long = scalarLong("SELECT COUNT(*) $fromClause $whereClause", whereArgs)
 
         val rows = mutableListOf<AdminUserOverview>()
+        // userId → primary provider(users.provider). 아래 secondary(user_identities) 와 합쳐 linkedProviders 구성.
+        val primaryProviderById = HashMap<String, String>()
         val sql = """
             SELECT
-                u.id, u.email, u.name, u.role, u.created_at,
+                u.id, u.email, u.name, u.role, u.created_at, u.provider,
                 COALESCE(r.cnt, 0) AS render_count,
                 COALESCE(r.dur, 0) AS render_duration,
                 COALESCE(r.last_at, NULL) AS render_last,
@@ -191,8 +194,10 @@ class AdminRepository {
                 val lastActivity = listOfNotNull(renderLast, sepLast).maxOrNull() ?: created
                 val sepCount = rs.getLong("sep_count")
                 val sepPlugin = rs.getLong("sep_plugin_count")
+                val userId = (rs.getObject("id") as UUID).toString()
+                primaryProviderById[userId] = rs.getString("provider")
                 rows += AdminUserOverview(
-                    userId = (rs.getObject("id") as UUID).toString(),
+                    userId = userId,
                     email = rs.getString("email"),
                     name = rs.getString("name"),
                     role = rs.getString("role"),
@@ -205,7 +210,24 @@ class AdminRepository {
                 )
             }
         }
-        rows to total
+
+        // 연결된 provider 부착 — 이 페이지 사용자들의 user_identities(secondary) 를 한 번에 조회 후 매핑.
+        // (primary=users.provider 는 위에서 캡처.) 통합 안 한 계정은 provider 1개만 나온다.
+        val ids = rows.map { UUID.fromString(it.userId) }
+        val secondaryByAccount: Map<UUID, List<String>> =
+            if (ids.isEmpty()) emptyMap()
+            else UserIdentitiesTable
+                .select(UserIdentitiesTable.accountId, UserIdentitiesTable.provider)
+                .where { UserIdentitiesTable.accountId inList ids }
+                .groupBy({ it[UserIdentitiesTable.accountId] }, { it[UserIdentitiesTable.provider] })
+        val enriched = rows.map { u ->
+            val providers = (
+                listOfNotNull(primaryProviderById[u.userId]) +
+                    (secondaryByAccount[UUID.fromString(u.userId)] ?: emptyList())
+                ).distinct()
+            u.copy(linkedProviders = providers)
+        }
+        enriched to total
     }
 
     /**

@@ -122,6 +122,8 @@ export interface AdminUserOverview {
   pluginSeparations: number;
   totalSourceDurationMs: number;
   lastActivityAt: string;
+  /** 이 계정에 연결된 로그인 provider ('google'|'apple'). 계정 통합 안 했으면 1개. */
+  linkedProviders: string[];
 }
 
 export interface AdminUsersResponse {

@@ -89,7 +89,7 @@ export default function LoginPage() {
             <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-neutral-900 text-base font-semibold tracking-tight text-white shadow-sm">
               vb
             </div>
-            <h1 className="text-2xl font-semibold tracking-tight">vibi · admin</h1>
+            <h1 className="text-2xl font-semibold tracking-tight">VIBI for Admin</h1>
             <p className="mt-1.5 text-sm text-neutral-500">영상은 남기고, 소음만 지운다</p>
           </div>
 
