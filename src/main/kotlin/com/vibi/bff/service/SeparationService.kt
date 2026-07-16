@@ -7,6 +7,7 @@ import com.vibi.bff.model.PersoProjectInfo
 import com.vibi.bff.model.SeparationSpec
 import com.vibi.bff.plugins.AppJson
 import com.vibi.bff.plugins.PersoApiException
+import com.vibi.bff.plugins.PersoJobFailedException
 import com.vibi.bff.routes.ObjectKey
 import com.vibi.bff.routes.contentTypeForExtension
 import io.ktor.http.ContentType
@@ -53,12 +54,20 @@ internal const val BACKGROUND_STEM_ID = "background"
 /** 리액션(효과음·추임새·비주 화자) 포함 배경음 — OriginalSubBackground. base 와 함께 노출해 사용자가 택일. */
 internal const val BACKGROUND_REACTION_STEM_ID = "background_reaction"
 
+/** 분류되지 않은 인프라/파이프라인 오류 시 클라이언트에 노출하는 generic 문구. raw upstream 메시지
+ *  (Perso body 등) 를 `job.error` 로 그대로 내보내면 안 됨 (sanitize 규약 34b7002) — 원문은 서버
+ *  ERROR 로그에만 남기고 사용자에겐 이 문구만 보인다. */
+internal const val GENERIC_SEPARATION_FAILURE_MESSAGE = "Separation failed. Please try again."
+
 data class SeparationJob(
     val jobId: String,
     @Volatile var status: String = "QUEUED",
     @Volatile var progress: Int = 0,
     @Volatile var progressReason: String? = null,
     @Volatile var error: String? = null,
+    /** FAILED 시 클라이언트 로컬라이즈용 stable code. 인프라 오류는 null (generic 처리),
+     *  사용자 조치 가능 실패(Perso Failed 등)는 "no_audio_detected" 등 코드 set. */
+    @Volatile var errorCode: String? = null,
     val outputDir: File,
     @Volatile var stems: List<LocalStem> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
@@ -331,11 +340,20 @@ class SeparationService(
                 }
             } catch (e: Exception) {
                 job.status = "FAILED"
-                job.error = e.message
                 queue?.markFailed(jobId)
                 runCatching { onJobFailed?.invoke(jobId) }
                     .onFailure { ex -> log.warn("refund hook failed jobId={}: {}", jobId, ex.message) }
-                log.error("Resumed separation pipeline failed: jobId={}", jobId, e)
+                // executePipeline 과 동일 분류 — 사용자 조치 가능 실패(재개된 폴링에서 Perso `Failed`
+                // 등)는 ERROR/Sentry 가 아니라 WARN + friendly 안내. 진짜 인프라 오류만 ERROR.
+                val actionable = classifyUserActionableFailure(e)
+                if (actionable != null) {
+                    job.error = actionable.userMessage
+                    job.errorCode = actionable.code
+                    log.warn("Resumed separation job failed (user-actionable): jobId={} code={}", jobId, actionable.code)
+                } else {
+                    job.error = GENERIC_SEPARATION_FAILURE_MESSAGE
+                    log.error("Resumed separation pipeline failed: jobId={}", jobId, e)
+                }
             } finally {
                 onJobChange?.invoke()
             }
@@ -346,6 +364,36 @@ class SeparationService(
      *  SUBMITTING (dispatcher claimNext 결과) 또는 in-memory only (queue==null 분기).
      *  markReady DB 콜은 runPipelineDownloadPhase 내부에서 stems_json/actualDurationMs 와
      *  함께 atomic 하게 처리되므로 여기서는 markFailed 만 다룬다. */
+    /**
+     * 파이프라인 실패 예외 중 **사용자 조치로 회복 가능한 정상 실패**를 식별해 friendly 안내
+     * ([PersoJobFailedException]) 로 변환. null 이면 진짜 인프라/파이프라인 오류(ERROR 로그 대상).
+     *
+     * 대상:
+     *  - [PersoJobFailedException] : 폴링 단계에서 이미 분류된 케이스(Perso `Failed`) 그대로 통과.
+     *  - Perso 400 `VIDEO_DURATION_TOO_SHORT`(F4009) : 입력 오디오가 1초 미만 → 더 긴 클립 재시도 안내.
+     *  - Perso `empty startGenerateProjectIdList` : 분리 프로젝트가 생성되지 않음(재시도 소진 후) →
+     *    잠시 후 재시도 안내.
+     *
+     * Perso 원문(body)은 클라이언트로 노출하지 않는다(sanitize 규약) — 코드 + friendly 문구만 전달.
+     */
+    private fun classifyUserActionableFailure(e: Throwable): PersoJobFailedException? = when {
+        e is PersoJobFailedException -> e
+        e is PersoApiException && e.statusCode == 400 &&
+            ("VIDEO_DURATION_TOO_SHORT" in e.body || "F4009" in e.body) ->
+            PersoJobFailedException(
+                code = "audio_too_short",
+                userMessage = "The audio is too short to separate. Please use a clip at least 1 second long and try again.",
+            )
+        // 우리가 던지는 정확한 문구(PersoClient.submitAudioSeparation)만 매칭 — 미래의 무관한 5xx 가
+        // 같은 필드명을 body 에 담아도 사용자 조치 실패로 오분류되지 않도록 phrase 전체를 요구.
+        e is PersoApiException && "empty startGenerateProjectIdList" in e.body ->
+            PersoJobFailedException(
+                code = "separation_start_failed",
+                userMessage = "Couldn't start audio separation. Please try again in a moment.",
+            )
+        else -> null
+    }
+
     private suspend fun executePipeline(job: SeparationJob) {
         // 동일 잡 동시실행 가드 — reaper 오판으로 재claim 된 잡이 첫 실행이 살아있는 동안 다시
         // 들어오면 즉시 버린다. add()=false 면 이미 in-flight. 차단된 쪽은 capacity 만 풀고 종료.
@@ -363,13 +411,25 @@ class SeparationService(
             }
         } catch (e: Exception) {
             job.status = "FAILED"
-            job.error = e.message
             queue?.markFailed(job.jobId)
-            // 선차감 환불 — 라우트에서 reserve 한 크레딧이 있다면 복원. 환불 자체가 throw 해도
-            // pipeline 의 FAILED 마킹은 그대로 유지 (runCatching).
+            // 선차감 환불 — 라우트에서 reserve 한 크레딧이 있다면 복원. 실패 원인 무관하게 항상
+            // 환불(사용자 조치 가능 실패든 인프라 오류든 잡이 산출물을 못 냈으면 과금하지 않는다).
+            // 환불 자체가 throw 해도 pipeline 의 FAILED 마킹은 그대로 유지 (runCatching).
             runCatching { onJobFailed?.invoke(job.jobId) }
                 .onFailure { ex -> log.warn("refund hook failed jobId={}: {}", job.jobId, ex.message) }
-            log.error("Separation pipeline failed: jobId={}", job.jobId, e)
+            val actionable = classifyUserActionableFailure(e)
+            if (actionable != null) {
+                // 사용자 조치로 회복 가능한 정상 실패 — ERROR/Sentry 가 아니라 WARN + 안내 문구.
+                // 원문(Perso body) 은 클라이언트에 노출하지 않고 friendly 문구로 대체(sanitize 규약).
+                job.error = actionable.userMessage
+                job.errorCode = actionable.code
+                log.warn("Separation job failed (user-actionable): jobId={} code={}", job.jobId, actionable.code)
+            } else {
+                // 진짜 인프라/파이프라인 오류 — ERROR 로 남겨 조사 대상으로. raw 메시지는 로그에만,
+                // 사용자 노출 job.error 는 generic 문구 (upstream body 유출 방지 · sanitize 규약).
+                job.error = GENERIC_SEPARATION_FAILURE_MESSAGE
+                log.error("Separation pipeline failed: jobId={}", job.jobId, e)
+            }
         } finally {
             // in-flight 가드 해제 — 이후 정상 재시도 (다른 인스턴스 / 후속 claim) 는 다시 진입 가능.
             inFlight.remove(job.jobId)

@@ -307,6 +307,12 @@ data class SeparationStatusResponse(
     val progress: Int? = null,
     val progressReason: String? = null,
     val error: String? = null,
+    /**
+     * FAILED 상태에서 클라이언트가 로컬라이즈 매핑에 쓰는 stable code. 사용자 조치 가능 실패만 set —
+     * 예: `no_audio_detected` (오디오 트랙 부재/비호환 코덱). 인프라 오류는 null (클라는 [error] 폴백
+     * 문구 표시). 클라이언트는 코드를 자국어 안내로 매핑하고, 미지의 코드는 [error] 를 그대로 표시.
+     */
+    val errorCode: String? = null,
     val stems: List<StemInfo> = emptyList(),
     /**
      * READY 상태에서 stem FLAC 의 실측 길이(ms). 클라이언트가 사용자 선택 trim 길이 대신 이 값을

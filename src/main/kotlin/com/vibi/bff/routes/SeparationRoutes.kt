@@ -19,6 +19,7 @@ import com.vibi.bff.service.FfmpegRunner
 import com.vibi.bff.service.FileStorageService
 import com.vibi.bff.service.InsufficientCreditsException
 import com.vibi.bff.service.MediaTrimmer
+import com.vibi.bff.service.ObjectMissingException
 import com.vibi.bff.service.ObjectStore
 import com.vibi.bff.service.PersoClient
 import com.vibi.bff.service.SeparationQueueRepository
@@ -51,6 +52,11 @@ private val SEPARATION_INPUT_EXTENSIONS = AUDIO_EXTENSIONS + SEPARATION_VIDEO_EX
 /** 단일 분리 잡의 측정 길이 상한(분). Perso 는 분당 과금 + WAV stem egress 도 분 비례 → 무제한 길이는
  *  무제한 비용. 서버 측정 길이(computeSeparationSourceDurationMs)에 적용. env MAX_SEPARATION_MINUTES 조정. */
 private val MAX_SEPARATION_MINUTES = (System.getenv("MAX_SEPARATION_MINUTES")?.toIntOrNull() ?: 60).coerceAtLeast(1)
+
+/** 분리 최소 길이(ms). Perso 는 1초(1000ms) 미만 오디오를 F4009(VIDEO_DURATION_TOO_SHORT)로 거절한다.
+ *  서버 측정 길이가 있으면 submit 전에 미리 거절해, 폴링 단계의 애매한 no_audio_detected 대신 명확한
+ *  audio_too_short 안내를 준다(측정 실패 시엔 통과 → Perso 400 이 classifyUserActionableFailure 로 매핑). */
+private const val MIN_SEPARATION_MS = 1000L
 
 fun Route.separationRoutes(
     separationService: SeparationService,
@@ -116,6 +122,20 @@ fun Route.separationRoutes(
                 )
             }
             val isVideoSource = "video" in probe.streamKinds
+
+            // 최소 길이 가드 — 실측 길이가 있고 1초 미만이면 submit(과금) 전에 즉시 거절. Perso 가
+            // 폴링 단계에서 Failed 로 내면 no_audio_detected 로만 보여 "too short" 를 구분 못 하므로,
+            // 확정적으로 측정된 케이스는 여기서 audio_too_short 로 명확히 안내한다. probe 실패(null/0)면
+            // 통과 — 크레딧/캡과 마찬가지로 conservative (거짓 거절 방지).
+            val probedMs = probe.durationMs
+            if (probedMs != null && probedMs in 1 until MIN_SEPARATION_MS) {
+                sourceFile.delete()
+                throw ApiErrorException(
+                    HttpStatusCode.UnprocessableEntity,
+                    "audio_too_short",
+                    "최소 1초 이상의 오디오가 필요합니다.",
+                )
+            }
 
             // submit / 크레딧 reserve 어느 단계든 throw 시 caller-owned source 파일이
             // 디스크에 남는 것을 막기 위해 try-catch. submit 성공 후엔 service 가 owner —
@@ -237,6 +257,7 @@ fun Route.separationRoutes(
                 progress = job.progress,
                 progressReason = job.progressReason,
                 error = job.error,
+                errorCode = job.errorCode,
                 stems = stems,
                 actualDurationMs = job.actualDurationMs,
                 queuePosition = queuePosition,
@@ -287,6 +308,10 @@ fun Route.separationRoutes(
             // SeparationJob 은 placeholder File 을 들고 있고 실체는 R2. ObjectStore.uploadIfAbsent
             // 가 HEAD 로 R2 hit 확인 후 signed URL. R2 도 없으면 그 안에서 throw.
             val ext = stem.file.extension.ifBlank { "flac" }
+            // stem 실체가 R2 lifecycle(7일) 만료로 사라진 옛 잡 재요청은 500/ERROR 가 아니라 410
+            // stem_expired 로 응답 (히스토리 숨김이 대부분 걸러내지만 경계 레이스 방어). ObjectStore
+            // 의 download/upload 가 부재 시 ObjectMissingException 을 던진다.
+            try {
             if (token == null) {
                 // 플러그인(UXP) 경로: pure-JS mix/재생이 WAV PCM 만 처리하므로 stem(FLAC)을 WAV 로 제공.
                 // R2 가 있으면 transcode 한 WAV 를 캐시(첫 1회만 변환→업로드, 이후 presigned 로 즉시) —
@@ -359,6 +384,10 @@ fun Route.separationRoutes(
                 store = objectStore,
                 asJsonUrl = false,
             )
+            } catch (e: ObjectMissingException) {
+                // R2 만료로 stem 실체 부재 — 410 Gone + stem_expired (StatusPages 가 INFO 로그, Sentry X).
+                throw ApiErrorException(HttpStatusCode.Gone, "stem_expired", "This separation result has expired.")
+            }
         }
 
         // DELETE /api/v2/separate/{jobId} — 저장된 분리 삭제(행 + R2 stem purge). 멱등 204.

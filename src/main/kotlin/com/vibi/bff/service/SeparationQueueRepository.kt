@@ -8,6 +8,7 @@ import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
@@ -364,12 +365,27 @@ class SeparationQueueRepository {
     /** owner+project 의 READY 분리 목록(최신순). projectId NULL 은 NULL row 와 매칭(null-safe eq). */
     suspend fun listReadyHistory(userId: UUID, projectId: String?): List<SeparationHistoryRow> =
         newSuspendedTransaction(Dispatchers.IO) {
+            // R2 lifecycle 로 stem 이 이미 만료됐을 오래된 잡은 숨긴다 — 복원 시 410 나는 카드를 애초에
+            // 노출하지 않기 위함(option 3). 경계 레이스는 stem 라우트의 410 stem_expired 가 방어.
+            //
+            // 컷오프 기준은 finishedAt(=markReady 시각 ≈ stem R2 업로드 시각) — R2 lifecycle 시계가
+            // 객체 '업로드' 시점에 시작하므로 createdAt(submit 시각)으로 재면 처리시간(Δ)만큼 이르게
+            // 숨겨져 아직 다운로드 가능한 결과가 사라진다. legacy(finishedAt NULL, 반드시 오래된 행)만
+            // createdAt 으로 폴백.
+            val cutoff = Instant.now().minusSeconds(historyRetentionSec)
             SeparationJobsTable
                 .selectAll()
                 .where {
                     (SeparationJobsTable.userId eq userId) and
                         (SeparationJobsTable.status eq STATUS_READY) and
-                        (SeparationJobsTable.projectId eq projectId)
+                        (SeparationJobsTable.projectId eq projectId) and
+                        (
+                            (SeparationJobsTable.finishedAt greaterEq cutoff) or
+                                (
+                                    SeparationJobsTable.finishedAt.isNull() and
+                                        (SeparationJobsTable.createdAt greaterEq cutoff)
+                                )
+                        )
                 }
                 .orderBy(SeparationJobsTable.createdAt, SortOrder.DESC)
                 .map { row ->
@@ -434,6 +450,21 @@ class SeparationQueueRepository {
         const val STATUS_PROCESSING = "PROCESSING"
         const val STATUS_READY = "READY"
         const val STATUS_FAILED = "FAILED"
+
+        /**
+         * 히스토리 목록 노출 상한(초) — R2 lifecycle(deploy/r2-lifecycle.json, `delete-after-7d`)이
+         * stem 객체를 7일 후 삭제하므로, 그보다 오래된 잡은 stem 실체가 사라져 복원 시 410 이 된다.
+         * 목록 단계에서 미리 숨겨(option 3) 만료 카드 노출을 막는다.
+         *
+         * ⚠️ 이 값은 R2 lifecycle 의 Expiration Days 와 **반드시 일치**해야 한다 — 둘은 별도 설정
+         * (deploy JSON vs BFF env)이라 자동 연동이 없다. lifecycle 을 늘리는데 이 값을 안 늘리면 아직
+         * 다운로드 가능한 결과가 히스토리에서 사라지고(데이터 가시성 손실), 반대로 이 값이 더 크면 이미
+         * 만료된 카드가 노출돼 클릭 시 410 이 난다. r2-lifecycle.json 을 바꿀 땐 env 도 함께 조정할 것.
+         * env `SEPARATION_HISTORY_RETENTION_DAYS` 로 override.
+         */
+        val historyRetentionSec: Long =
+            (System.getenv("SEPARATION_HISTORY_RETENTION_DAYS")?.toLongOrNull() ?: 7L)
+                .coerceAtLeast(1L) * 86_400L
     }
 }
 
