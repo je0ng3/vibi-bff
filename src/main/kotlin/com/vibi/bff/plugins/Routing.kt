@@ -148,7 +148,7 @@ fun Application.configureRouting(
             )
             // 입력 파형 미리보기(UXP 가 mp3/AAC 디코드 불가). 무차감 — 자체 in-flight cap 으로 보호.
             peaksRoutes(fileStorage, jwtSecret = appConfig.auth.jwtSecret)
-            adminRoutes(adminRepository, jwtSecret = appConfig.auth.jwtSecret)
+            adminRoutes(adminRepository, persoClient = persoClient, jwtSecret = appConfig.auth.jwtSecret)
 
             // 임시 — 음성분리 mock. testdata/<startSec>-<endSec>/ 디렉터리 구조.
             // 각 폴더 안에 stem 오디오 파일들 (배경음/화자1/... 한글 파일명, .wav/.mp3/.m4a 등).

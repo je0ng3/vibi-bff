@@ -290,6 +290,21 @@ class PersoClient(
         }
     }
 
+    /**
+     * Space(=Perso 계정)의 남은 quota = 잔여 크레딧. admin 대시보드 표시용 read-only 호출.
+     * 다른 control-plane 호출과 동일하게 XP-API-KEY 인증 + transient 5xx retry.
+     * 응답 잔액은 `result.remainingQuota.remainingQuota` 로 한 겹 더 중첩 (Perso 구조) — 누락 시 0.
+     */
+    suspend fun getRemainingQuota(): Long {
+        return withTransientRetry("getRemainingQuota") {
+            val response = httpClient.get(url(
+                "/video-translator/api/v1/projects/spaces/${config.spaceSeq}/plan/status"
+            )) { authHeader() }
+            checkResponse(response)
+            response.body<PersoEnvelope<PersoPlanStatus>>().result.remainingQuota?.remainingQuota ?: 0L
+        }
+    }
+
     // ── Progress poll ────────────────────────────────────────────────────────
     suspend fun getProgress(projectSeq: Long): PersoProgressResult {
         return withTransientRetry("getProgress($projectSeq)") {
