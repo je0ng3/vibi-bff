@@ -37,6 +37,18 @@ private fun Throwable.isClientDisconnect(): Boolean {
 class NotFoundException(message: String) : RuntimeException(message)
 class PersoApiException(val statusCode: Int, val body: String) : RuntimeException("Perso API error $statusCode: $body")
 
+/**
+ * Perso 분리 잡이 `progressReason=Failed` / `hasFailed` 로 종료된 경우 — 인프라 장애가 아니라
+ * 입력(오디오 트랙 부재 / 비호환 코덱 등)이 원인인, **사용자 조치로 회복 가능한 정상 실패**.
+ * 서버 ERROR 로그 / Sentry 로 올리지 않고 잡을 FAILED 로 마킹 + 크레딧 환불 + 사용자 안내 문구로
+ * 다룬다. [code] 는 클라이언트가 로컬라이즈 매핑에 쓰는 stable key, [userMessage] 는 코드 매핑이
+ * 없는 클라이언트를 위한 폴백 안내 문구.
+ */
+class PersoJobFailedException(
+    val code: String,
+    val userMessage: String,
+) : RuntimeException("Perso job failed ($code): $userMessage")
+
 // Structured API error: lets a handler specify the wire error code + detail
 // independently of a free-form message. Use for validation failures where
 // the client switches on the `error` field (e.g. "trim_end_exceeds_duration").

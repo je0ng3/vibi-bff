@@ -8,6 +8,23 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class PersoEnvelope<T>(val result: T)
 
+// --- Plan status: space 의 남은 quota(= Perso 계정 잔여 크레딧) + 플랜 정보 ---
+// GET /video-translator/api/v1/projects/spaces/{spaceSeq}/plan/status
+// 잔액은 result.remainingQuota.remainingQuota 로 한 겹 더 중첩돼 있다 (Perso 응답 구조).
+@Serializable
+data class PersoPlanStatus(
+    val spaceSeq: Long? = null,
+    val planTier: String? = null,
+    val remainingQuota: PersoRemainingQuota? = null,
+    val resetDateTime: String? = null,
+    val isCancellationScheduled: Boolean = false,
+)
+
+@Serializable
+data class PersoRemainingQuota(
+    val remainingQuota: Long = 0,
+)
+
 // --- Upload: SAS token ---
 @Serializable
 data class PersoSasTokenResponse(

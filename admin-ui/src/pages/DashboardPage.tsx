@@ -132,15 +132,31 @@ export default function DashboardPage() {
       {/* 보조 누적 지표 */}
       <section className="space-y-4">
         <h2 className="text-sm font-medium text-neutral-500">누적 지표</h2>
-        <div className="rounded-lg border border-blue-200 bg-blue-50 p-6">
-          <div className="text-xs font-medium uppercase tracking-wide text-blue-700">
-            전체 사용자 보유 크레딧 총합
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="rounded-lg border border-blue-200 bg-blue-50 p-6">
+            <div className="text-xs font-medium uppercase tracking-wide text-blue-700">
+              총 필요 크레딧
+            </div>
+            <div className="mt-2 text-4xl font-bold tabular-nums tracking-tight text-blue-900">
+              {(o.totalUserCredits * 60 * 0.5).toLocaleString()}
+            </div>
+            <div className="mt-1 text-sm text-blue-700">
+              전체 사용자 보유 크레딧 총합(분) {o.totalUserCredits.toLocaleString()} × 60 × 0.5
+            </div>
           </div>
-          <div className="mt-2 text-4xl font-bold tabular-nums tracking-tight text-blue-900">
-            {o.totalUserCredits.toLocaleString()}
-          </div>
-          <div className="mt-1 text-sm text-blue-700">
-            × 60 = {(o.totalUserCredits * 60).toLocaleString()}
+          {/* Perso 계정(space) 잔여 크레딧 — XP-API-KEY 기준. 외부 호출 실패 시 null → "조회 실패". */}
+          <div className="rounded-lg border border-violet-200 bg-violet-50 p-6">
+            <div className="text-xs font-medium uppercase tracking-wide text-violet-700">
+              Perso 계정 잔여 크레딧
+            </div>
+            {o.persoAccountCredits != null ? (
+              <div className="mt-2 text-4xl font-bold tabular-nums tracking-tight text-violet-900">
+                {o.persoAccountCredits.toLocaleString()}
+              </div>
+            ) : (
+              <div className="mt-2 text-2xl font-semibold text-violet-400">조회 실패</div>
+            )}
+            <div className="mt-1 text-sm text-violet-700">Perso API 기준 남은 quota</div>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">

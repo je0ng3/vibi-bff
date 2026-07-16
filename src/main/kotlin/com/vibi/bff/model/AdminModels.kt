@@ -113,6 +113,9 @@ data class AdminOverview(
     val activeUsersLast7Days: Long,
     // 전체 사용자가 현재 보유한 크레딧 잔액 합계 (user_credits.balance 의 SUM). 소비 후 잔액 기준.
     val totalUserCredits: Long = 0,
+    // Perso 계정(space)의 남은 quota = 잔여 크레딧 (XP-API-KEY 기준). DB 아닌 외부 호출이라
+    // 라우트에서 best-effort 로 채운다 — Perso 조회 실패 시 null (대시보드는 정상 표시).
+    val persoAccountCredits: Long? = null,
     // 음원분리 잡 1건당 평균 입력 길이 ms. 전체 + 클라이언트별 (mobile/plugin). 잡이 없으면 0.
     val avgSeparationDurationMs: Long = 0,
     val avgMobileSeparationDurationMs: Long = 0,

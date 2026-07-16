@@ -96,6 +96,8 @@ export interface AdminOverview {
   activeUsersLast7Days: number;
   /** 전체 사용자가 현재 보유한 크레딧 잔액 합계 (소비하면 줄어든다). */
   totalUserCredits: number;
+  /** Perso 계정(space)의 남은 quota = 잔여 크레딧. 외부 호출 실패 시 null. */
+  persoAccountCredits: number | null;
   /** 음원분리 잡 1건당 평균 입력 길이 ms — 전체 + 클라이언트별. 잡이 없으면 0. */
   avgSeparationDurationMs: number;
   avgMobileSeparationDurationMs: number;

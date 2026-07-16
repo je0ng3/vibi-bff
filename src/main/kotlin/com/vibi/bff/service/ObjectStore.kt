@@ -24,6 +24,12 @@ import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * R2 에 대상 객체가 없고 로컬 실체도 없어 서빙 불가 — 운영상 대부분 **R2 lifecycle 만료**(7일)
+ * 후 옛 jobId 를 조회한 케이스. 호출자(라우트)가 이걸 잡아 500/ERROR 가 아니라 410 `stem_expired`
+ * (INFO) 로 응답하도록 한 전용 타입 (generic RuntimeException 과 구분해 정확히 분기). */
+class ObjectMissingException(message: String) : RuntimeException(message)
+
+/**
  * Cloudflare R2 (S3-compatible) object store + SigV4 presigned URL 발급.
  *
  * 큰 산출물(render mp4, separation stem, mix) 을 R2 bucket 에 업로드 후 presigned URL 로
@@ -87,8 +93,8 @@ class ObjectStore(
         }
         if (!fileExists) {
             // R2 도 없고 로컬도 없음 — 진짜 데이터 없음. 운영상 발생하면 R2 lifecycle 만료 후
-            // 옛 jobId 를 GET 한 케이스. throw 로 caller 가 5xx 응답하게 함.
-            throw IllegalStateException(
+            // 옛 jobId 를 GET 한 케이스. 라우트가 410 stem_expired 로 분기하도록 전용 예외.
+            throw ObjectMissingException(
                 "Object missing in R2 and no local file: r2://$bucket/$objectKey",
             )
         }
@@ -191,6 +197,20 @@ class ObjectStore(
                 tmpFile.toPath(),
             )
             Files.move(tmpFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (e: NoSuchKeyException) {
+            // R2 lifecycle 만료(7일) 후 옛 stem 조회 — 라우트가 410 stem_expired 로 분기하도록 전용 예외.
+            tmpFile.delete()
+            throw ObjectMissingException("Object missing in R2 (expired?): r2://$bucket/$objectKey")
+        } catch (e: S3Exception) {
+            tmpFile.delete()
+            // GET(getObject)은 missing key 에 404(NoSuchKey)로 응답한다 — HEAD/List 와 달리 403 은
+            // "없음"이 아니라 진짜 인증/권한 실패(토큰 회전·권한 회수 등)다. 여기서 403 을 missing 으로
+            // 뭉개면 bucket-wide auth 장애가 사용자에겐 대량 stem_expired(410, INFO)로 위장되고 Sentry
+            // 도 안 울린다. 그래서 404 만 만료로 매핑하고 그 외(403 포함)는 그대로 던져 500/ERROR/Sentry.
+            if (e.statusCode() == 404) {
+                throw ObjectMissingException("Object missing in R2 (expired?): r2://$bucket/$objectKey")
+            }
+            throw e
         } catch (e: Throwable) {
             tmpFile.delete()
             throw e
