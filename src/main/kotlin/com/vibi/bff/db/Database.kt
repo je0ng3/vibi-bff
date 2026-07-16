@@ -24,8 +24,12 @@ object DbBootstrap {
         val isH2 = config.jdbcUrl.startsWith("jdbc:h2:")
         val hikari = HikariConfig().apply {
             jdbcUrl = config.jdbcUrl
-            username = config.user
-            password = config.password
+            // 자격증명은 (a) 분리 env(DB_USER/DB_PASSWORD) 또는 (b) URL 쿼리파라미터
+            // (?user=&password=) 두 방식 모두 지원. blank 일 때 username/password 를 세팅하면
+            // Hikari 가 빈 문자열을 pgjdbc 프로퍼티로 넘겨 URL 내장 자격증명을 덮어써 인증이
+            // 실패하므로, 값이 있을 때만 세팅한다.
+            if (config.user.isNotBlank()) username = config.user
+            if (config.password.isNotBlank()) password = config.password
             maximumPoolSize = config.maxPoolSize
             driverClassName = if (isH2) "org.h2.Driver" else "org.postgresql.Driver"
             // 트랜잭션 격리 — Postgres default (READ_COMMITTED) 와 일치. 명시해 H2 와도 동등.
