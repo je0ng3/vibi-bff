@@ -23,9 +23,17 @@ object CreditCatalog {
     fun creditsFor(productId: String): Int? = products[productId]
 }
 
+/**
+ * `GET /credits` 응답.
+ *
+ * - [balance] — 사용자 크레딧 잔액.
+ * - [separationAvailable] — 서비스(Perso 계정) quota 소진 여부. false 면 모바일 메인화면이
+ *   "서비스 크레딧 소진" 공지를 띄운다. 미확인(Perso 조회 실패)은 fail-open 으로 true.
+ */
 @Serializable
 data class CreditBalanceResponse(
     val balance: Int,
+    val separationAvailable: Boolean = true,
 )
 
 /**

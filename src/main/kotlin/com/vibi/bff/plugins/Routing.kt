@@ -19,6 +19,7 @@ import com.vibi.bff.service.GoogleOAuthClient
 import com.vibi.bff.service.FileStorageService
 import com.vibi.bff.service.ObjectStore
 import com.vibi.bff.service.PersoClient
+import com.vibi.bff.service.PersoQuotaCache
 import com.vibi.bff.service.RenderInputCacheService
 import com.vibi.bff.service.RenderService
 import com.vibi.bff.service.SeparationQueueRepository
@@ -106,6 +107,9 @@ fun Application.configureRouting(
             }
         }
 
+        // Perso 잔여 quota TTL 캐시 — admin 대시보드 KPI 와 /credits separationAvailable 공유.
+        val persoQuotaCache = PersoQuotaCache(persoClient)
+
         route("/api/v2") {
             // /auth/* 는 무인증 게이트웨이 — IP 키 레이트리밋으로 가입 보너스 크레딧 양산 차단.
             rateLimit(RL_AUTH) {
@@ -127,6 +131,7 @@ fun Application.configureRouting(
                 googleVerifier = googleReceiptVerifier,
                 adMobVerifier = adMobSsvVerifier,
                 adMobDailyCap = appConfig.iap.admob?.dailyCap ?: com.vibi.bff.config.AdMobConfig.DEFAULT_DAILY_CAP,
+                persoQuotaCache = persoQuotaCache,
                 jwtSecret = appConfig.auth.jwtSecret,
             )
             assetRoutes(objectStore, jwtSecret = appConfig.auth.jwtSecret)
@@ -148,7 +153,7 @@ fun Application.configureRouting(
             )
             // 입력 파형 미리보기(UXP 가 mp3/AAC 디코드 불가). 무차감 — 자체 in-flight cap 으로 보호.
             peaksRoutes(fileStorage, jwtSecret = appConfig.auth.jwtSecret)
-            adminRoutes(adminRepository, persoClient = persoClient, jwtSecret = appConfig.auth.jwtSecret)
+            adminRoutes(adminRepository, persoQuotaCache = persoQuotaCache, jwtSecret = appConfig.auth.jwtSecret)
 
             // 임시 — 음성분리 mock. testdata/<startSec>-<endSec>/ 디렉터리 구조.
             // 각 폴더 안에 stem 오디오 파일들 (배경음/화자1/... 한글 파일명, .wav/.mp3/.m4a 등).

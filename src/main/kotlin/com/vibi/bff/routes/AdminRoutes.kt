@@ -7,7 +7,7 @@ import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.service.AdminRepository
-import com.vibi.bff.service.PersoClient
+import com.vibi.bff.service.PersoQuotaCache
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
@@ -23,12 +23,6 @@ import java.time.format.DateTimeParseException
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.slf4j.LoggerFactory
-
-private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
-
-/** Perso 잔여 크레딧 캐시 엔트리 — value=마지막 조회값(실패 반영 안 함), fetchedAtMs=성공 시각. */
-private data class CachedPersoQuota(val value: Long?, val fetchedAtMs: Long)
 
 /**
  * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
@@ -42,35 +36,16 @@ private data class CachedPersoQuota(val value: Long?, val fetchedAtMs: Long)
  */
 fun Route.adminRoutes(
     adminRepository: AdminRepository,
-    persoClient: PersoClient,
+    persoQuotaCache: PersoQuotaCache,
     jwtSecret: String,
-    persoQuotaCacheTtlMs: Long = 60_000,
 ) {
-    // Perso 잔여 크레딧은 매 overload 마다 외부 호출하면 낭비 + 대시보드 30초 자동갱신과 겹쳐 부담이라
-    // 짧은 TTL 캐시. 조회 실패 시 마지막 성공값 유지(있으면), 없으면 null 로 노출 — 대시보드는 항상 렌더.
-    val quotaCache = java.util.concurrent.atomic.AtomicReference<CachedPersoQuota?>(null)
-
-    suspend fun persoAccountCredits(): Long? {
-        val now = System.currentTimeMillis()
-        val cached = quotaCache.get()
-        if (cached != null && now - cached.fetchedAtMs < persoQuotaCacheTtlMs) return cached.value
-        return try {
-            val fetched = persoClient.getRemainingQuota()
-            quotaCache.set(CachedPersoQuota(fetched, now))
-            fetched
-        } catch (e: Exception) {
-            adminLog.warn("Perso remaining quota fetch failed: {}", e.message)
-            cached?.value // 마지막 성공값 유지 (없으면 null)
-        }
-    }
-
     route("/admin") {
 
         // 상단 KPI 카드 — 전체 사용자/잡 카운트 + 누적 분량 + 최근 7일 active user.
         get("/overview") {
             call.requireAdmin(jwtSecret)
             val data = withContext(Dispatchers.IO) { adminRepository.getOverview() }
-            call.respond(HttpStatusCode.OK, data.copy(persoAccountCredits = persoAccountCredits()))
+            call.respond(HttpStatusCode.OK, data.copy(persoAccountCredits = persoQuotaCache.remainingQuota()))
         }
 
         // 일별 추세. from / to 는 ISO date (YYYY-MM-DD). 누락 시 default 최근 30일.
