@@ -13,6 +13,7 @@ import com.vibi.bff.plugins.requireUser
 import com.vibi.bff.plugins.requireUserActiveIfPossible
 import com.vibi.bff.service.CreditCost
 import com.vibi.bff.service.CreditRepository
+import com.vibi.bff.service.PersoQuotaCache
 import com.vibi.bff.service.UserRepository
 import com.vibi.bff.service.iap.AdMobSsvVerifier
 import com.vibi.bff.service.iap.AppleReceiptVerifier
@@ -55,6 +56,7 @@ fun Route.creditRoutes(
     googleVerifier: GoogleReceiptVerifier?,
     adMobVerifier: AdMobSsvVerifier?,
     adMobDailyCap: Int,
+    persoQuotaCache: PersoQuotaCache,
     jwtSecret: String,
 ) {
     route("/credits") {
@@ -63,7 +65,12 @@ fun Route.creditRoutes(
             // silent 로 주는 대신 401 account_deleted 로 재로그인 유도. exists 는 PK 단일 lookup.
             val principal = call.requireUserActiveIfPossible(jwtSecret, userRepository)!!
             val balance = withContext(Dispatchers.IO) { creditRepository.balance(principal.userId) }
-            call.respond(CreditBalanceResponse(balance = balance))
+            call.respond(
+                CreditBalanceResponse(
+                    balance = balance,
+                    separationAvailable = !persoQuotaCache.isBelowReserve(),
+                )
+            )
         }
 
         // 모바일이 "이 구간 분리 X 크레딧 사용, 진행?" 팝업 표시 전에 호출.

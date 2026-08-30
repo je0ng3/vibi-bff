@@ -1,13 +1,17 @@
 package com.vibi.bff.routes
 
+import com.vibi.bff.model.AdminBlockedRejoin
+import com.vibi.bff.model.AdminBlockedRejoinsResponse
 import com.vibi.bff.model.AdminSetRoleRequest
+import com.vibi.bff.model.AdminUnblockRejoinResponse
 import com.vibi.bff.model.AdminUserJobsResponse
 import com.vibi.bff.model.AdminUsersResponse
 import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.service.AdminRepository
-import com.vibi.bff.service.PersoClient
+import com.vibi.bff.service.PersoQuotaCache
+import com.vibi.bff.service.UserRepository
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
@@ -27,9 +31,6 @@ import org.slf4j.LoggerFactory
 
 private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
-/** Perso 잔여 크레딧 캐시 엔트리 — value=마지막 조회값(실패 반영 안 함), fetchedAtMs=성공 시각. */
-private data class CachedPersoQuota(val value: Long?, val fetchedAtMs: Long)
-
 /**
  * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
  * role=admin JWT 강제. URL slug 숨김 (landing middleware) + role 검사 이중 방어.
@@ -42,35 +43,17 @@ private data class CachedPersoQuota(val value: Long?, val fetchedAtMs: Long)
  */
 fun Route.adminRoutes(
     adminRepository: AdminRepository,
-    persoClient: PersoClient,
+    persoQuotaCache: PersoQuotaCache,
+    userRepository: UserRepository,
     jwtSecret: String,
-    persoQuotaCacheTtlMs: Long = 60_000,
 ) {
-    // Perso 잔여 크레딧은 매 overload 마다 외부 호출하면 낭비 + 대시보드 30초 자동갱신과 겹쳐 부담이라
-    // 짧은 TTL 캐시. 조회 실패 시 마지막 성공값 유지(있으면), 없으면 null 로 노출 — 대시보드는 항상 렌더.
-    val quotaCache = java.util.concurrent.atomic.AtomicReference<CachedPersoQuota?>(null)
-
-    suspend fun persoAccountCredits(): Long? {
-        val now = System.currentTimeMillis()
-        val cached = quotaCache.get()
-        if (cached != null && now - cached.fetchedAtMs < persoQuotaCacheTtlMs) return cached.value
-        return try {
-            val fetched = persoClient.getRemainingQuota()
-            quotaCache.set(CachedPersoQuota(fetched, now))
-            fetched
-        } catch (e: Exception) {
-            adminLog.warn("Perso remaining quota fetch failed: {}", e.message)
-            cached?.value // 마지막 성공값 유지 (없으면 null)
-        }
-    }
-
     route("/admin") {
 
         // 상단 KPI 카드 — 전체 사용자/잡 카운트 + 누적 분량 + 최근 7일 active user.
         get("/overview") {
             call.requireAdmin(jwtSecret)
             val data = withContext(Dispatchers.IO) { adminRepository.getOverview() }
-            call.respond(HttpStatusCode.OK, data.copy(persoAccountCredits = persoAccountCredits()))
+            call.respond(HttpStatusCode.OK, data.copy(persoAccountCredits = persoQuotaCache.remainingQuota()))
         }
 
         // 일별 추세. from / to 는 ISO date (YYYY-MM-DD). 누락 시 default 최근 30일.
@@ -214,6 +197,40 @@ fun Route.adminRoutes(
             }
             if (updated == 0) throw NotFoundException("user not found")
             call.respond(HttpStatusCode.OK, AdminSetRoleRequest(role = body.role))
+        }
+
+        // 탈퇴 후 재가입이 막혀 있는 identity 목록. PII 없음 — provider + 시각만으로 대상 특정.
+        get("/blocked-rejoins") {
+            call.requireAdmin(jwtSecret)
+            val blocked = withContext(Dispatchers.IO) { userRepository.listBlockedRejoins() }
+            call.respond(
+                HttpStatusCode.OK,
+                AdminBlockedRejoinsResponse(
+                    blocked = blocked.map {
+                        AdminBlockedRejoin(
+                            identityHash = it.identityHash,
+                            provider = it.provider,
+                            deletedAt = it.deletedAt.toString(),
+                            blockedUntil = it.blockedUntil.toString(),
+                        )
+                    },
+                ),
+            )
+        }
+
+        // 차단 해제 — 실수 탈퇴 복구 / 앱 심사자 잠금 해제. 해제 즉시 재가입 가능해진다.
+        // DELETE 대신 POST 인 이유: admin UI 의 mutating 액션이 모두 POST 규약(adminPost) 이다.
+        post("/blocked-rejoins/{identityHash}/unblock") {
+            call.requireAdmin(jwtSecret)
+            val hash = call.parameters["identityHash"]
+                ?: throw NotFoundException("identityHash required")
+            // PK 는 SHA-256 hex 64자 — 형식이 다르면 조회할 것도 없다.
+            if (!hash.matches(Regex("[0-9a-f]{64}"))) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_identity_hash")
+            }
+            val unblocked = withContext(Dispatchers.IO) { userRepository.unblockRejoin(hash) }
+            adminLog.info("rejoin block lifted by admin: hash={} removed={}", hash.take(12), unblocked)
+            call.respond(HttpStatusCode.OK, AdminUnblockRejoinResponse(unblocked = unblocked))
         }
     }
 }

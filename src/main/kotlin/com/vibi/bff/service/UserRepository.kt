@@ -2,6 +2,7 @@ package com.vibi.bff.service
 
 import com.vibi.bff.db.AccountDeletionsTable
 import com.vibi.bff.db.AccountMergesTable
+import com.vibi.bff.db.DeletedIdentitiesTable
 import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.RenderJobsTable
 import com.vibi.bff.db.SeparationJobsTable
@@ -10,9 +11,14 @@ import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AuthProvider
 import com.vibi.bff.model.LinkedIdentity
+import java.security.MessageDigest
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.less
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.neq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
@@ -47,6 +53,17 @@ import org.jetbrains.exposed.sql.upsert
  * 으로 판별 — onUpdate 에서 updatedAt 만 갱신하므로 INSERT 직후 한 번만 둘이 일치한다.
  */
 data class UpsertedUser(val id: UUID, val role: String, val isNewUser: Boolean)
+
+/**
+ * 재가입이 차단된 identity 1건 (admin 목록용). PII 없음 — [identityHash] 는 해제 API 의 키로만
+ * 쓰이고 원 identity 로 역산되지 않는다.
+ */
+data class BlockedRejoin(
+    val identityHash: String,
+    val provider: String,
+    val deletedAt: Instant,
+    val blockedUntil: Instant,
+)
 
 class UserRepository {
 
@@ -428,7 +445,7 @@ class UserRepository {
      */
     fun delete(userId: UUID): Int = transaction {
         val snapshot = UsersTable
-            .select(UsersTable.provider, UsersTable.createdAt)
+            .select(UsersTable.provider, UsersTable.providerSub, UsersTable.createdAt)
             .where { UsersTable.id eq userId }
             .firstOrNull()
         if (snapshot != null) {
@@ -437,8 +454,93 @@ class UserRepository {
                 it[signedUpAt] = snapshot[UsersTable.createdAt]
                 it[deletedAt] = Instant.now()
             }
+            recordDeletedIdentities(userId, snapshot[UsersTable.provider], snapshot[UsersTable.providerSub])
         }
         UsersTable.deleteWhere { UsersTable.id eq userId }
+    }
+
+    /**
+     * 재가입 차단 tombstone 적재 — primary + 링크된 secondary identity 전부의 해시를
+     * [DeletedIdentitiesTable] 에 upsert (재탈퇴 시 deleted_at 갱신). users 하드 삭제와 같은
+     * 트랜잭션이라 "삭제됐는데 tombstone 누락"이 없다. 기회적으로 차단 창의 2배가 지난
+     * 만료 row 도 함께 정리해 테이블이 무한 성장하지 않는다.
+     */
+    private fun recordDeletedIdentities(userId: UUID, primaryProvider: String, primarySub: String) {
+        val now = Instant.now()
+        val identities = buildList {
+            add(primaryProvider to primarySub)
+            UserIdentitiesTable
+                .select(UserIdentitiesTable.provider, UserIdentitiesTable.providerSub)
+                .where { UserIdentitiesTable.accountId eq userId }
+                .forEach { add(it[UserIdentitiesTable.provider] to it[UserIdentitiesTable.providerSub]) }
+        }
+        identities.forEach { (identityProvider, sub) ->
+            DeletedIdentitiesTable.upsert {
+                it[identityHash] = identityHash(identityProvider, sub)
+                it[provider] = identityProvider
+                it[deletedAt] = now
+            }
+        }
+        DeletedIdentitiesTable.deleteWhere {
+            DeletedIdentitiesTable.deletedAt less now.minus(REJOIN_BLOCK.multipliedBy(2))
+        }
+    }
+
+    /**
+     * 탈퇴 후 재가입 차단 판정 — `(provider, providerSub)` 가 **신규 가입이 될 identity** 이고
+     * [REJOIN_BLOCK] 창 안에 탈퇴 tombstone 이 있으면 true. 기존 계정이 있는 로그인
+     * (primary 재로그인 / 링크된 secondary) 은 항상 false — 가입만 막고 로그인은 막지 않는다.
+     */
+    fun isBlockedRejoin(provider: AuthProvider, providerSub: String): Boolean = transaction {
+        val hasAccount = UsersTable.selectAll()
+            .where { (UsersTable.provider eq provider.dbValue) and (UsersTable.providerSub eq providerSub) }
+            .limit(1).any() ||
+            UserIdentitiesTable.selectAll()
+                .where {
+                    (UserIdentitiesTable.provider eq provider.dbValue) and
+                        (UserIdentitiesTable.providerSub eq providerSub)
+                }
+                .limit(1).any()
+        if (hasAccount) return@transaction false
+        DeletedIdentitiesTable.selectAll()
+            .where {
+                (DeletedIdentitiesTable.identityHash eq identityHash(provider.dbValue, providerSub)) and
+                    (DeletedIdentitiesTable.deletedAt greater Instant.now().minus(REJOIN_BLOCK))
+            }
+            .limit(1).any()
+    }
+
+    /**
+     * 현재 재가입이 막혀 있는 identity 목록 — admin "차단 목록" 페이지용. [REJOIN_BLOCK] 창 안의
+     * tombstone 만(만료분은 이미 차단력이 없으므로 제외) 최근 탈퇴 순으로 반환.
+     *
+     * PII 가 없어(해시 + provider + 시각) "누구인지"는 알 수 없다 — 운영자는 provider 와 탈퇴
+     * 시각으로 대상을 특정한다 (예: 심사자가 방금 지운 apple 계정 = 가장 최근 apple 행).
+     */
+    fun listBlockedRejoins(): List<BlockedRejoin> = transaction {
+        DeletedIdentitiesTable
+            .selectAll()
+            .where { DeletedIdentitiesTable.deletedAt greater Instant.now().minus(REJOIN_BLOCK) }
+            .orderBy(DeletedIdentitiesTable.deletedAt to SortOrder.DESC)
+            .map {
+                val deletedAt = it[DeletedIdentitiesTable.deletedAt]
+                BlockedRejoin(
+                    identityHash = it[DeletedIdentitiesTable.identityHash],
+                    provider = it[DeletedIdentitiesTable.provider],
+                    deletedAt = deletedAt,
+                    blockedUntil = deletedAt.plus(REJOIN_BLOCK),
+                )
+            }
+    }
+
+    /**
+     * 차단 해제 — tombstone 을 지워 즉시 재가입 가능하게 한다. 실수 탈퇴 복구 / 앱 심사자 잠금
+     * 해제용. 반환: 실제로 지워졌으면 true (이미 없거나 만료 후 정리됐으면 false).
+     */
+    fun unblockRejoin(identityHash: String): Boolean = transaction {
+        DeletedIdentitiesTable.deleteWhere {
+            DeletedIdentitiesTable.identityHash eq identityHash
+        } > 0
     }
 
     /**
@@ -448,5 +550,16 @@ class UserRepository {
      */
     fun exists(userId: UUID): Boolean = transaction {
         UsersTable.selectAll().where { UsersTable.id eq userId }.limit(1).any()
+    }
+
+    companion object {
+        /** 탈퇴 후 재가입 차단 창 — [isBlockedRejoin] 판정 기준. 모바일 안내 문구(30일)와 동기. */
+        val REJOIN_BLOCK: Duration = Duration.ofDays(30)
+
+        /** tombstone 키 — "provider:providerSub" 의 SHA-256 hex. PII 역산 방지용 단방향 해시. */
+        internal fun identityHash(provider: String, providerSub: String): String =
+            MessageDigest.getInstance("SHA-256")
+                .digest("$provider:$providerSub".encodeToByteArray())
+                .joinToString("") { b -> ((b.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
     }
 }

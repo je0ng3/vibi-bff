@@ -23,9 +23,18 @@ object CreditCatalog {
     fun creditsFor(productId: String): Int? = products[productId]
 }
 
+/**
+ * `GET /credits` 응답.
+ *
+ * - [balance] — 사용자 크레딧 잔액.
+ * - [separationAvailable] — 서비스(Perso 계정) quota 가용 여부. 잔여가 예비분
+ *   ([com.vibi.bff.service.PersoQuotaCache.DEFAULT_RESERVE]) 이하면 false — 모바일이 메인화면
+ *   공지를 띄우고 신규 분리를 막는다. 미확인(Perso 조회 실패)은 fail-open 으로 true.
+ */
 @Serializable
 data class CreditBalanceResponse(
     val balance: Int,
+    val separationAvailable: Boolean = true,
 )
 
 /**

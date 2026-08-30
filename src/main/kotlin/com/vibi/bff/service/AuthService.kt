@@ -211,6 +211,16 @@ class AuthService(
         val email = identity.email
         val name = identity.name
         val picture = identity.picture
+        // 재가입 차단 — 탈퇴 후 REJOIN_BLOCK(30일) 내 같은 identity 의 신규 가입 거부
+        // (탈퇴→재가입 반복으로 가입 보너스 크레딧 반복 수령 abuse 방지). 기존 계정이 있는
+        // 로그인(재로그인/링크된 identity)은 isBlockedRejoin 이 false 라 영향 없음.
+        val blockedRejoin = withContext(Dispatchers.IO) {
+            userRepository.isBlockedRejoin(identity.provider, identity.providerSub)
+        }
+        if (blockedRejoin) {
+            log.info("rejoin blocked (recently deleted identity): provider={}", identity.provider.dbValue)
+            throw ApiErrorException(HttpStatusCode.Forbidden, "recently_deleted")
+        }
         // resolveOrCreate — 링크된 secondary identity 로 로그인 시 spurious 신규 계정을 만들지
         // 않고 기존 계정으로 resolve. 신규 가입만 isNewUser=true 로 보너스 분기.
         val upserted = withContext(Dispatchers.IO) {
