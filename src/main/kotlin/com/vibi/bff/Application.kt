@@ -204,6 +204,11 @@ fun Application.module() {
             // 만료된 device-code(로그인 미완료/중단분) 정리 — TTL 10분이라 1h sweep 으로 충분.
             runCatching { deviceCodeRepository.deleteExpired() }
                 .onFailure { cleanupLog.warn("device code sweep failed (will retry in 1h): {}", it.message, it) }
+            // 인스턴스 교체/크래시로 종료 갱신을 못 받은 유령 렌더 잡을 FAILED 로 정리 — 안 하면
+            // admin "진행 중 작업"에 경과시간이 무한히 자라는 row 로 남는다(실측 146시간).
+            // 실패는 reapStuckRenderJobs 내부에서 WARN 로그 + 빈 목록으로 흡수된다(분석 write 는
+            // non-fatal 규약) — 여기서 다시 runCatching 하지 않는다.
+            jobAnalyticsRepository.reapStuckRenderJobs(JobAnalyticsRepository.STUCK_RENDER_THRESHOLD)
             delay(TimeUnit.HOURS.toMillis(1))
         }
     }
