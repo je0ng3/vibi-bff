@@ -68,7 +68,7 @@ fun Route.creditRoutes(
             call.respond(
                 CreditBalanceResponse(
                     balance = balance,
-                    separationAvailable = !persoQuotaCache.isExhausted(),
+                    separationAvailable = !persoQuotaCache.isBelowReserve(),
                 )
             )
         }
