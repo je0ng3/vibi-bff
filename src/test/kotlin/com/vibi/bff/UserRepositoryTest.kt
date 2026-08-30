@@ -5,6 +5,7 @@ import com.vibi.bff.db.AccountDeletionsTable
 import com.vibi.bff.db.AccountMergesTable
 import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.DbBootstrap
+import com.vibi.bff.db.DeletedIdentitiesTable
 import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AuthProvider
@@ -122,6 +123,92 @@ class UserRepositoryTest {
         repo.delete(UUID.randomUUID())
         val count = transaction { AccountDeletionsTable.selectAll().count() }
         assertEquals(0L, count)
+    }
+
+    // ── 탈퇴 후 재가입 차단 (deleted_identities tombstone) ─────────────────────
+
+    @Test
+    fun `isBlockedRejoin is true within window after delete, false for other identities`() {
+        val u = repo.upsert(AuthProvider.GOOGLE, "g-rejoin", "r@example.com", "R", null)
+        assertFalse(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-rejoin")) // 계정 존재 → 차단 아님
+        repo.delete(u.id)
+        assertTrue(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-rejoin"))
+        // 다른 sub / 다른 provider 는 무관.
+        assertFalse(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-other"))
+        assertFalse(repo.isBlockedRejoin(AuthProvider.APPLE, "g-rejoin"))
+    }
+
+    @Test
+    fun `delete tombstones linked secondary identities too`() {
+        val u = repo.upsert(AuthProvider.GOOGLE, "g-pri", "p@example.com", "P", null)
+        repo.linkOrMerge(u.id, AuthProvider.APPLE, "a-sec", "p@icloud.com", "P", null)
+        repo.delete(u.id)
+        assertTrue(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-pri"))
+        assertTrue(repo.isBlockedRejoin(AuthProvider.APPLE, "a-sec"))
+    }
+
+    @Test
+    fun `isBlockedRejoin ignores expired tombstones`() {
+        val u = repo.upsert(AuthProvider.GOOGLE, "g-old", "o@example.com", "O", null)
+        repo.delete(u.id)
+        // tombstone 을 창 밖(31일 전)으로 밀어 만료 시나리오 재현.
+        transaction {
+            DeletedIdentitiesTable.update {
+                it[deletedAt] = java.time.Instant.now().minus(java.time.Duration.ofDays(31))
+            }
+        }
+        assertFalse(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-old"))
+    }
+
+    @Test
+    fun `listBlockedRejoins exposes provider and window, hiding expired rows`() {
+        val g = repo.upsert(AuthProvider.GOOGLE, "g-list", "g@example.com", "G", null)
+        val a = repo.upsert(AuthProvider.APPLE, "a-list", "a@example.com", "A", null)
+        repo.delete(g.id)
+        repo.delete(a.id)
+
+        val blocked = repo.listBlockedRejoins()
+        assertEquals(2, blocked.size)
+        // 최근 탈퇴 순 — 목록 상단이 운영자가 방금 막힌 대상(심사자 등)을 찾는 자리.
+        assertEquals(setOf("google", "apple"), blocked.map { it.provider }.toSet())
+        // 차단 만료 시각이 노출돼야 "언제 풀리는지" 를 UI 가 표시할 수 있다.
+        blocked.forEach {
+            assertEquals(it.deletedAt.plus(UserRepository.REJOIN_BLOCK), it.blockedUntil)
+        }
+
+        // 창 밖으로 민 row 는 차단력이 없으므로 목록에서도 빠진다.
+        transaction {
+            DeletedIdentitiesTable.update({
+                DeletedIdentitiesTable.identityHash eq UserRepository.identityHash("google", "g-list")
+            }) {
+                it[deletedAt] = java.time.Instant.now().minus(java.time.Duration.ofDays(31))
+            }
+        }
+        assertEquals(listOf("apple"), repo.listBlockedRejoins().map { it.provider })
+    }
+
+    @Test
+    fun `unblockRejoin lifts the block so the identity can sign up again`() {
+        val u = repo.upsert(AuthProvider.GOOGLE, "g-unblock", "u@example.com", "U", null)
+        repo.delete(u.id)
+        assertTrue(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-unblock"))
+
+        val hash = repo.listBlockedRejoins().single().identityHash
+        assertTrue(repo.unblockRejoin(hash))
+
+        assertFalse(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-unblock"))
+        assertTrue(repo.listBlockedRejoins().isEmpty())
+        // 이미 없는 행 해제는 false — UI 가 "이미 해제됨" 을 구분할 수 있다.
+        assertFalse(repo.unblockRejoin(hash))
+    }
+
+    @Test
+    fun `tombstone does not block once an account exists again`() {
+        val u = repo.upsert(AuthProvider.GOOGLE, "g-back", "b@example.com", "B", null)
+        repo.delete(u.id)
+        // (예: 운영자 수동 복구 등으로) 계정이 다시 생기면 로그인은 차단하지 않는다.
+        repo.upsert(AuthProvider.GOOGLE, "g-back", "b@example.com", "B", null)
+        assertFalse(repo.isBlockedRejoin(AuthProvider.GOOGLE, "g-back"))
     }
 
     // ── 계정 통합 (linking / merge) ────────────────────────────────────────────

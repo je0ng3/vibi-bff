@@ -1,6 +1,9 @@
 package com.vibi.bff.routes
 
+import com.vibi.bff.model.AdminBlockedRejoin
+import com.vibi.bff.model.AdminBlockedRejoinsResponse
 import com.vibi.bff.model.AdminSetRoleRequest
+import com.vibi.bff.model.AdminUnblockRejoinResponse
 import com.vibi.bff.model.AdminUserJobsResponse
 import com.vibi.bff.model.AdminUsersResponse
 import com.vibi.bff.plugins.ApiErrorException
@@ -8,6 +11,7 @@ import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.PersoQuotaCache
+import com.vibi.bff.service.UserRepository
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.receive
@@ -23,6 +27,9 @@ import java.time.format.DateTimeParseException
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.slf4j.LoggerFactory
+
+private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
 /**
  * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
@@ -37,6 +44,7 @@ import kotlinx.coroutines.withContext
 fun Route.adminRoutes(
     adminRepository: AdminRepository,
     persoQuotaCache: PersoQuotaCache,
+    userRepository: UserRepository,
     jwtSecret: String,
 ) {
     route("/admin") {
@@ -189,6 +197,40 @@ fun Route.adminRoutes(
             }
             if (updated == 0) throw NotFoundException("user not found")
             call.respond(HttpStatusCode.OK, AdminSetRoleRequest(role = body.role))
+        }
+
+        // 탈퇴 후 재가입이 막혀 있는 identity 목록. PII 없음 — provider + 시각만으로 대상 특정.
+        get("/blocked-rejoins") {
+            call.requireAdmin(jwtSecret)
+            val blocked = withContext(Dispatchers.IO) { userRepository.listBlockedRejoins() }
+            call.respond(
+                HttpStatusCode.OK,
+                AdminBlockedRejoinsResponse(
+                    blocked = blocked.map {
+                        AdminBlockedRejoin(
+                            identityHash = it.identityHash,
+                            provider = it.provider,
+                            deletedAt = it.deletedAt.toString(),
+                            blockedUntil = it.blockedUntil.toString(),
+                        )
+                    },
+                ),
+            )
+        }
+
+        // 차단 해제 — 실수 탈퇴 복구 / 앱 심사자 잠금 해제. 해제 즉시 재가입 가능해진다.
+        // DELETE 대신 POST 인 이유: admin UI 의 mutating 액션이 모두 POST 규약(adminPost) 이다.
+        post("/blocked-rejoins/{identityHash}/unblock") {
+            call.requireAdmin(jwtSecret)
+            val hash = call.parameters["identityHash"]
+                ?: throw NotFoundException("identityHash required")
+            // PK 는 SHA-256 hex 64자 — 형식이 다르면 조회할 것도 없다.
+            if (!hash.matches(Regex("[0-9a-f]{64}"))) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_identity_hash")
+            }
+            val unblocked = withContext(Dispatchers.IO) { userRepository.unblockRejoin(hash) }
+            adminLog.info("rejoin block lifted by admin: hash={} removed={}", hash.take(12), unblocked)
+            call.respond(HttpStatusCode.OK, AdminUnblockRejoinResponse(unblocked = unblocked))
         }
     }
 }

@@ -238,3 +238,22 @@ export interface AdminJobStatusBreakdown {
   failed: number;
   inProgress: number;
 }
+
+/**
+ * 탈퇴 후 재가입이 차단된 identity 1건. PII 없음 — 운영자는 provider + 탈퇴시각으로 대상을
+ * 특정한다 (서버가 해시만 보관하므로 이메일/이름을 줄 수 없다).
+ */
+export interface AdminBlockedRejoin {
+  identityHash: string;
+  provider: string;
+  deletedAt: string;
+  blockedUntil: string;
+}
+
+export interface AdminBlockedRejoinsResponse {
+  blocked: AdminBlockedRejoin[];
+}
+
+export interface AdminUnblockRejoinResponse {
+  unblocked: boolean;
+}

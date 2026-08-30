@@ -267,3 +267,30 @@ data class AdminJobStatusBreakdown(
     val failed: Long,
     val inProgress: Long,
 )
+
+/**
+ * 재가입이 차단된 identity 1건 — 탈퇴 후 30일 재가입 차단(가입 보너스 반복 수령 방지) 목록.
+ *
+ * PII 를 담지 않는다 — 이메일/이름 없이 [provider] 와 시각만으로 대상을 특정한다 (tombstone
+ * 자체가 해시만 보관). [identityHash] 는 해제 API 의 키.
+ *
+ * - [deletedAt] / [blockedUntil] — ISO-8601 instant.
+ */
+@Serializable
+data class AdminBlockedRejoin(
+    val identityHash: String,
+    val provider: String,
+    val deletedAt: String,
+    val blockedUntil: String,
+)
+
+@Serializable
+data class AdminBlockedRejoinsResponse(
+    val blocked: List<AdminBlockedRejoin>,
+)
+
+/** 차단 해제 결과 — [unblocked] false 면 이미 해제됐거나 만료 정리된 항목. */
+@Serializable
+data class AdminUnblockRejoinResponse(
+    val unblocked: Boolean,
+)
