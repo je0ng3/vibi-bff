@@ -10,6 +10,7 @@ import {
 } from "../lib/api";
 import { formatDurationMs, formatIsoDateTime } from "../lib/format";
 import { providerBadgeClass, providerLabel } from "../lib/providers";
+import DataTable from "../components/DataTable";
 
 const PAGE_SIZE = 50;
 const CREDITS_PAGE_SIZE = 50;
@@ -105,32 +106,27 @@ export default function UserDetailPage() {
           이 사용자의 render 잡이 아직 없습니다.
         </p>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
-          <table className="min-w-full divide-y divide-neutral-200 text-sm">
-            <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
-              <tr>
-                <th className="px-4 py-3">Job ID</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3 text-right">Duration</th>
-                <th className="px-4 py-3 text-right">Separations</th>
-                <th className="px-4 py-3">Created</th>
-                <th className="px-4 py-3">Finished</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-100">
-              {data.jobs.map((j) => (
-                <tr key={j.jobId} className="hover:bg-neutral-50">
-                  <td className="px-4 py-3 font-mono text-xs text-neutral-700">{j.jobId}</td>
-                  <td className="px-4 py-3"><StatusBadge status={j.status} /></td>
-                  <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(j.sourceDurationMs)}</td>
-                  <td className="px-4 py-3 text-right tabular-nums">{j.separationCount}</td>
-                  <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(j.createdAt)}</td>
-                  <td className="px-4 py-3 text-neutral-600">{j.finishedAt ? formatIsoDateTime(j.finishedAt) : "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={[
+            { label: "Job ID" },
+            { label: "Status" },
+            { label: "Duration", align: "right" },
+            { label: "Separations", align: "right" },
+            { label: "Created" },
+            { label: "Finished" },
+          ]}
+        >
+          {data.jobs.map((j) => (
+            <tr key={j.jobId} className="hover:bg-neutral-50">
+              <td className="px-4 py-3 font-mono text-xs text-neutral-700">{j.jobId}</td>
+              <td className="px-4 py-3"><StatusBadge status={j.status} /></td>
+              <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(j.sourceDurationMs)}</td>
+              <td className="px-4 py-3 text-right tabular-nums">{j.separationCount}</td>
+              <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(j.createdAt)}</td>
+              <td className="px-4 py-3 text-neutral-600">{j.finishedAt ? formatIsoDateTime(j.finishedAt) : "-"}</td>
+            </tr>
+          ))}
+        </DataTable>
       )}
 
       {totalPages > 1 && (
@@ -154,21 +150,36 @@ export default function UserDetailPage() {
 // 한 스트림으로. 최신순이며 "더 보기" 로 이어붙인다 (잡 목록의 페이지 이동과 달리 누적 열람이
 // 자연스러운 이력 화면이라).
 function CreditsSection({ userId }: { userId: string }) {
+  const navigate = useNavigate();
   const [summary, setSummary] = useState<AdminUserCreditsResponse | null>(null);
   const [events, setEvents] = useState<AdminCreditEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
 
-  const load = async (offset: number) => {
+  // cancelled: userId 가 바뀌면 이전 사용자의 늦은 응답이 새 사용자 화면을 덮어쓰지 않게 버린다
+  // (같은 페이지의 잡·계정 로드와 동일한 규약).
+  const load = async (offset: number, cancelled?: () => boolean) => {
     setLoading(true);
     try {
       const res = await adminFetch<AdminUserCreditsResponse>(
         `/api/v2/admin/users/${userId}/credits?limit=${CREDITS_PAGE_SIZE}&offset=${offset}`,
       );
+      if (cancelled?.()) return;
       setSummary(res);
-      setEvents((prev) => (offset === 0 ? res.events : [...prev, ...res.events]));
-    } catch {
-      // 잡 목록 표시를 막지 않는 best-effort 섹션 — 인증 만료는 다른 요청이 로그인으로 보낸다.
+      // offset 페이징 도중 새 이벤트가 생기면 경계가 밀려 같은 행이 다시 올 수 있다 — 서버가 주는
+      // 전역 유니크 id 로 중복을 걸러낸다.
+      setEvents((prev) => {
+        if (offset === 0) return res.events;
+        const seen = new Set(prev.map((e) => e.id));
+        return [...prev, ...res.events.filter((e) => !seen.has(e.id))];
+      });
+    } catch (e) {
+      if (cancelled?.()) return;
+      // 인증 만료는 다른 섹션과 같이 로그인으로 — 그 외는 이 섹션만 실패 표시 (best-effort).
+      if (e instanceof AdminAuthError) {
+        navigate("/login", { replace: true });
+        return;
+      }
       setFailed(true);
     } finally {
       setLoading(false);
@@ -176,10 +187,12 @@ function CreditsSection({ userId }: { userId: string }) {
   };
 
   useEffect(() => {
+    let cancelled = false;
     setEvents([]);
     setSummary(null);
     setFailed(false);
-    void load(0);
+    void load(0, () => cancelled);
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
@@ -218,44 +231,41 @@ function CreditsSection({ userId }: { userId: string }) {
       {events.length === 0 ? (
         <p className="text-sm text-neutral-500">크레딧 변동 이력이 없습니다.</p>
       ) : (
-        <div className="overflow-x-auto rounded border border-neutral-200">
-          <table className="min-w-full divide-y divide-neutral-200 text-sm">
-            <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
-              <tr>
-                <th className="px-4 py-2">시각</th>
-                <th className="px-4 py-2">유형</th>
-                <th className="px-4 py-2 text-right">변동</th>
-                <th className="px-4 py-2">상세</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-100">
-              {events.map((e, i) => (
-                <tr key={`${e.at}:${e.type}:${i}`} className="hover:bg-neutral-50">
-                  <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(e.at)}</td>
-                  <td className="px-4 py-2">
-                    <span
-                      className={`rounded px-2 py-0.5 text-xs font-medium ${
-                        CREDIT_EVENT_BADGE[e.type] ?? "bg-neutral-100 text-neutral-700"
-                      }`}
-                    >
-                      {CREDIT_EVENT_LABEL[e.type] ?? e.type}
-                    </span>
-                  </td>
-                  <td
-                    className={`px-4 py-2 text-right tabular-nums font-medium ${
-                      e.delta < 0 ? "text-rose-600" : e.delta > 0 ? "text-emerald-700" : "text-neutral-500"
-                    }`}
-                  >
-                    {e.delta > 0 ? `+${e.delta}` : e.delta}
-                  </td>
-                  <td className="px-4 py-2 text-neutral-600">
-                    <CreditEventDetail event={e} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          dense
+          wrapperClassName="rounded border border-neutral-200"
+          columns={[
+            { label: "시각" },
+            { label: "유형" },
+            { label: "변동", align: "right" },
+            { label: "상세" },
+          ]}
+        >
+          {events.map((e) => (
+            <tr key={e.id} className="hover:bg-neutral-50">
+              <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(e.at)}</td>
+              <td className="px-4 py-2">
+                <span
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${
+                    CREDIT_EVENT_BADGE[e.type] ?? "bg-neutral-100 text-neutral-700"
+                  }`}
+                >
+                  {CREDIT_EVENT_LABEL[e.type] ?? e.type}
+                </span>
+              </td>
+              <td
+                className={`px-4 py-2 text-right tabular-nums font-medium ${
+                  e.delta < 0 ? "text-rose-600" : e.delta > 0 ? "text-emerald-700" : "text-neutral-500"
+                }`}
+              >
+                {e.delta > 0 ? `+${e.delta}` : e.delta}
+              </td>
+              <td className="px-4 py-2 text-neutral-600">
+                <CreditEventDetail event={e} />
+              </td>
+            </tr>
+          ))}
+        </DataTable>
       )}
 
       {events.length < summary.total && (
@@ -285,67 +295,30 @@ function CreditEventDetail({ event }: { event: AdminCreditEvent }) {
   return <span>{event.detail ?? "-"}</span>;
 }
 
-// 계정 연결 상태 + 병합 이력. 통합(병합) 안 한 계정은 연결 수단 1개 + 병합 이력 0건.
+// 계정에 연결된 로그인 수단. 병합 이력(흡수된 계정·이월 크레딧)은 크레딧 타임라인의
+// "계정 병합 이월" 이벤트가 정본이라 여기서 중복 표시하지 않는다.
 function AccountSection({ account }: { account: AdminUserAccount }) {
-  const { identities, merges } = account;
+  const { identities } = account;
   return (
-    <section className="space-y-4 rounded-lg border border-neutral-200 bg-white p-4">
-      <div className="space-y-2">
-        <h2 className="text-sm font-semibold text-neutral-800">연결된 로그인 계정</h2>
-        {identities.length === 0 ? (
-          <p className="text-sm text-neutral-500">연결된 로그인 수단 정보가 없습니다.</p>
-        ) : (
-          <ul className="flex flex-wrap gap-2">
-            {identities.map((idn) => (
-              <li
-                key={`${idn.provider}:${idn.email}`}
-                className="flex items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-sm"
-              >
-                <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(idn.provider)}`}>
-                  {providerLabel(idn.provider)}
-                </span>
-                <span className="text-neutral-700">{idn.email}</span>
-                <span className="text-xs text-neutral-400">{idn.primary ? "primary" : "linked"}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      {merges.length > 0 && (
-        <div className="space-y-2">
-          <h2 className="text-sm font-semibold text-neutral-800">병합 이력</h2>
-          <p className="text-xs text-neutral-500">이 계정으로 흡수된 다른 계정 + 이월된 크레딧.</p>
-          <div className="overflow-x-auto rounded border border-neutral-200">
-            <table className="min-w-full divide-y divide-neutral-200 text-sm">
-              <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
-                <tr>
-                  <th className="px-4 py-2">흡수된 계정</th>
-                  <th className="px-4 py-2 text-right">이월 크레딧</th>
-                  <th className="px-4 py-2">병합 시각</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-neutral-100">
-                {merges.map((m, i) => (
-                  <tr key={`${m.fromProvider}:${m.fromEmail}:${i}`} className="hover:bg-neutral-50">
-                    <td className="px-4 py-2">
-                      <span className="flex items-center gap-2">
-                        <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(m.fromProvider)}`}>
-                          {providerLabel(m.fromProvider)}
-                        </span>
-                        <span className="text-neutral-700">{m.fromEmail}</span>
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums">
-                      {m.carriedCredits > 0 ? `+${m.carriedCredits}` : "0"}
-                    </td>
-                    <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(m.mergedAt)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+    <section className="space-y-2 rounded-lg border border-neutral-200 bg-white p-4">
+      <h2 className="text-sm font-semibold text-neutral-800">연결된 로그인 계정</h2>
+      {identities.length === 0 ? (
+        <p className="text-sm text-neutral-500">연결된 로그인 수단 정보가 없습니다.</p>
+      ) : (
+        <ul className="flex flex-wrap gap-2">
+          {identities.map((idn) => (
+            <li
+              key={`${idn.provider}:${idn.email}`}
+              className="flex items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-sm"
+            >
+              <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(idn.provider)}`}>
+                {providerLabel(idn.provider)}
+              </span>
+              <span className="text-neutral-700">{idn.email}</span>
+              <span className="text-xs text-neutral-400">{idn.primary ? "primary" : "linked"}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );

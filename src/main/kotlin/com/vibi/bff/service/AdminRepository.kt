@@ -1,9 +1,7 @@
 package com.vibi.bff.service
 
-import com.vibi.bff.db.AccountMergesTable
 import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
-import com.vibi.bff.model.AdminAccountMerge
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
 import com.vibi.bff.model.AdminCreditEvent
@@ -25,7 +23,6 @@ import java.time.format.DateTimeFormatter
 import java.util.UUID
 import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.IntegerColumnType
-import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.UUIDColumnType
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
@@ -555,35 +552,16 @@ class AdminRepository(
     }
 
     /**
-     * 사용자 상세 페이지용 — 계정에 연결된 로그인 수단 + 이 계정으로 흡수된 병합 이력.
+     * 사용자 상세 페이지용 — 계정에 연결된 로그인 수단.
      *
-     * identities: [UserRepository.listIdentities] 재사용 (users primary + user_identities secondary).
-     *   사용자 대면 GET /auth/identities 와 단일 소스라 조립 로직이 어긋나지 않는다. 없는 userId 는 빈 리스트.
-     * merges: account_merges 에서 into_account_id = userId (최신순). 병합이 없었으면 빈 리스트.
+     * [UserRepository.listIdentities] 재사용 (users primary + user_identities secondary). 사용자 대면
+     * GET /auth/identities 와 단일 소스라 조립 로직이 어긋나지 않는다. 없는 userId 는 빈 리스트.
+     *
+     * 병합 이력은 여기서 반환하지 않는다 — 같은 account_merges row 를 [getUserCredits] 의
+     * 타임라인이 'merge_carry' 이벤트로 이미 보여준다 (표시 정본 1곳).
      */
-    fun getUserAccount(userId: UUID): AdminUserAccount = transaction {
-        val identities = userRepository.listIdentities(userId)
-
-        val merges = AccountMergesTable
-            .select(
-                AccountMergesTable.fromProvider,
-                AccountMergesTable.fromEmail,
-                AccountMergesTable.carriedCredits,
-                AccountMergesTable.mergedAt,
-            )
-            .where { AccountMergesTable.intoAccountId eq userId }
-            .orderBy(AccountMergesTable.mergedAt, SortOrder.DESC)
-            .map {
-                AdminAccountMerge(
-                    fromProvider = it[AccountMergesTable.fromProvider],
-                    fromEmail = it[AccountMergesTable.fromEmail],
-                    carriedCredits = it[AccountMergesTable.carriedCredits],
-                    mergedAt = DateTimeFormatter.ISO_INSTANT.format(it[AccountMergesTable.mergedAt]),
-                )
-            }
-
-        AdminUserAccount(identities = identities, merges = merges)
-    }
+    fun getUserAccount(userId: UUID): AdminUserAccount =
+        transaction { AdminUserAccount(identities = userRepository.listIdentities(userId)) }
 
     /**
      * 사용자 상세 페이지용 — 크레딧 변동 타임라인 (최신순, 페이지네이션).
@@ -594,9 +572,9 @@ class AdminRepository(
      *   • credit_ledger       — signup / separation(consume, 음수) / refund
      *   • account_merges      — merge_carry (이월 크레딧)
      *
-     * consume/refund 의 ref_id 는 "consume-<jobId>" / "refund-<jobId>" 라 접두사를 떼고
-     * separation_jobs(TEXT PK) 와 LEFT JOIN 해 입력 길이를 붙인다 — "몇 분짜리 분리로 몇 개
-     * 차감" 표시용. 잡 row 가 없으면(오래된 잡·탈퇴 익명화) 길이만 null 이고 이벤트는 남는다.
+     * consume/refund 의 ref_id 는 "consume-<jobId>" / "refund-<jobId>" 라 접두사를 떼 잡 ID 를
+     * 얻고, 페이지가 확정된 뒤 그 ID 들만 separation_jobs(TEXT PK) 에서 조회해 입력 길이를 붙인다
+     * — "몇 분짜리 분리로 몇 개 차감" 표시용. 잡 row 가 이미 없으면 길이만 null 이고 이벤트는 남는다.
      *
      * 반환 [AdminUserCreditsResponse.balance] 와 이벤트 delta 합계가 어긋날 수 있는 이유는
      * 해당 DTO 의 KDoc 참조 (계정 병합의 re-point). hasMerges 로 UI 가 경고를 띄운다.
@@ -611,24 +589,34 @@ class AdminRepository(
             "SELECT COALESCE((SELECT balance FROM user_credits WHERE user_id = ?), 0)",
             listOf(uuidArg(userId)),
         ).toInt()
-        val mergeCount = scalarLong(
-            "SELECT COUNT(*) FROM account_merges WHERE into_account_id = ?",
-            listOf(uuidArg(userId)),
-        )
-        val total = mergeCount + scalarLong(
-            """
-                SELECT (SELECT COUNT(*) FROM credit_transactions WHERE user_id = ?)
-                     + (SELECT COUNT(*) FROM credit_ledger WHERE user_id = ?)
-            """.trimIndent(),
-            listOf(uuidArg(userId), uuidArg(userId)),
-        )
+        // 전체 건수 + 병합 유무를 한 번에 (세 소스를 각각 COUNT 하면 왕복만 늘어난다).
+        var total = 0L
+        var mergeCount = 0L
+        val countSql = """
+            SELECT (SELECT COUNT(*) FROM credit_transactions WHERE user_id = ?) AS tx_count,
+                   (SELECT COUNT(*) FROM credit_ledger WHERE user_id = ?) AS ledger_count,
+                   (SELECT COUNT(*) FROM account_merges WHERE into_account_id = ?) AS merge_count
+        """.trimIndent()
+        TransactionManager.current().exec(countSql, args = listOf(
+            uuidArg(userId), uuidArg(userId), uuidArg(userId),
+        )) { rs ->
+            if (rs.next()) {
+                mergeCount = rs.getLong("merge_count")
+                total = rs.getLong("tx_count") + rs.getLong("ledger_count") + mergeCount
+            }
+        }
 
         // 'day' 처럼 예약어 충돌을 피하려 별칭은 at/ev_type 사용. NULL 컬럼은 UNION 의 타입
         // 결정을 위해 CAST 필수 (H2 는 캐스트 없는 NULL 컬럼의 UNION 을 거부).
+        //
+        // ev_id 는 "<소스>:<PK>" 로 전역 유니크 — 같은 시각에 여러 이벤트가 몰려도 정렬이
+        // 결정적이라 페이지 경계에서 행이 중복/누락되지 않는다. 클라이언트의 append 중복 제거
+        // 키로도 쓰인다 (offset 페이징 중 새 이벤트가 생겨 경계가 밀리는 경우 방어).
         val sql = """
-            SELECT at, ev_type, delta, detail, job_id, source_duration_ms
+            SELECT ev_id, at, ev_type, delta, detail, job_id, source_duration_ms
             FROM (
-                SELECT ct.created_at AS at,
+                SELECT 'tx:' || CAST(ct.id AS VARCHAR) AS ev_id,
+                       ct.created_at AS at,
                        CASE ct.platform
                            WHEN 'admob' THEN 'ad_reward'
                            WHEN 'admin' THEN 'admin_grant'
@@ -641,21 +629,22 @@ class AdminRepository(
                 FROM credit_transactions ct
                 WHERE ct.user_id = ?
                 UNION ALL
-                SELECT cl.created_at,
+                SELECT 'ledger:' || CAST(cl.id AS VARCHAR),
+                       cl.created_at,
                        CASE cl.kind WHEN 'consume' THEN 'separation' ELSE cl.kind END,
                        CASE WHEN cl.kind = 'consume' THEN -cl.credits ELSE cl.credits END,
                        CAST(NULL AS VARCHAR),
-                       sj.id,
-                       sj.source_duration_ms
+                       CASE cl.kind
+                           WHEN 'consume' THEN SUBSTRING(cl.ref_id, 9)
+                           WHEN 'refund' THEN SUBSTRING(cl.ref_id, 8)
+                           ELSE NULL
+                       END,
+                       CAST(NULL AS BIGINT)
                 FROM credit_ledger cl
-                LEFT JOIN separation_jobs sj ON sj.id = CASE cl.kind
-                    WHEN 'consume' THEN SUBSTRING(cl.ref_id, 9)
-                    WHEN 'refund' THEN SUBSTRING(cl.ref_id, 8)
-                    ELSE NULL
-                END
                 WHERE cl.user_id = ?
                 UNION ALL
-                SELECT am.merged_at,
+                SELECT 'merge:' || CAST(am.id AS VARCHAR),
+                       am.merged_at,
                        'merge_carry',
                        am.carried_credits,
                        am.from_provider || ':' || am.from_email,
@@ -664,7 +653,7 @@ class AdminRepository(
                 FROM account_merges am
                 WHERE am.into_account_id = ?
             ) e
-            ORDER BY at DESC, ev_type ASC, delta ASC
+            ORDER BY at DESC, ev_id DESC
             LIMIT ? OFFSET ?
         """.trimIndent()
 
@@ -675,6 +664,7 @@ class AdminRepository(
             while (rs.next()) {
                 val durationMs = rs.getLong("source_duration_ms").takeIf { !rs.wasNull() }
                 events += AdminCreditEvent(
+                    id = rs.getString("ev_id"),
                     at = DateTimeFormatter.ISO_INSTANT.format(rs.getTimestamp("at").toInstant()),
                     type = rs.getString("ev_type"),
                     delta = rs.getInt("delta"),
@@ -682,6 +672,26 @@ class AdminRepository(
                     jobId = rs.getString("job_id"),
                     sourceDurationMs = durationMs,
                 )
+            }
+        }
+
+        // 입력 길이는 페이지에 실제로 뜬 잡(<= limit 건)만 PK 조회로 보강한다. UNION 안에서
+        // separation_jobs 를 LEFT JOIN 하면 LIMIT 전에 조인이 끝나야 해서, Postgres 가
+        // separation_jobs 전체를 해시로 올리고 사용자의 ledger 전 구간을 조인한다 (테이블이
+        // 커질수록 페이지 1장 여는 비용이 같이 커짐). 조인을 밖으로 빼 두 단계 모두 bounded.
+        val jobIds = events.mapNotNull { it.jobId }.distinct()
+        if (jobIds.isNotEmpty()) {
+            val durations = HashMap<String, Long>(jobIds.size)
+            val placeholders = jobIds.joinToString(", ") { "?" }
+            TransactionManager.current().exec(
+                "SELECT id, source_duration_ms FROM separation_jobs WHERE id IN ($placeholders)",
+                args = jobIds.map { textArg(it) },
+            ) { rs ->
+                while (rs.next()) durations[rs.getString("id")] = rs.getLong("source_duration_ms")
+            }
+            events.replaceAll { e ->
+                val ms = e.jobId?.let { durations[it] }
+                if (ms == null) e else e.copy(sourceDurationMs = ms)
             }
         }
 

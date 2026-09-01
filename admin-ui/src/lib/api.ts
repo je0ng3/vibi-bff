@@ -157,18 +157,12 @@ export interface AdminLinkedIdentity {
   primary: boolean;
 }
 
-/** 이 계정으로 흡수된 병합 1건. carriedCredits=이월 크레딧(무료 보너스 제외분, 0 가능). */
-export interface AdminAccountMerge {
-  fromProvider: string;
-  fromEmail: string;
-  carriedCredits: number;
-  mergedAt: string;
-}
-
-/** 사용자 상세 페이지의 계정 연결/병합 정보. */
+/**
+ * 사용자 상세 페이지의 계정 연결 정보. 병합 이력은 크레딧 타임라인의 'merge_carry' 이벤트가
+ * 정본이라 여기 담기지 않는다.
+ */
 export interface AdminUserAccount {
   identities: AdminLinkedIdentity[];
-  merges: AdminAccountMerge[];
 }
 
 /**
@@ -177,6 +171,8 @@ export interface AdminUserAccount {
  * jobId/sourceDurationMs 는 separation·refund 에서만 채워진다 (잡 row 가 남아있을 때).
  */
 export interface AdminCreditEvent {
+  /** "<소스>:<PK>" 전역 유니크 키 (tx:12 / ledger:34 / merge:5). 목록 key + append 중복 제거용. */
+  id: string;
   at: string;
   type: string;
   delta: number;

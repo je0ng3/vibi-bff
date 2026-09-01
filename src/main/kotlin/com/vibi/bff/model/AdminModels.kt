@@ -70,38 +70,26 @@ data class AdminUserJobsResponse(
 )
 
 /**
- * 사용자 상세 페이지에 표시할 계정 연결/병합 정보.
+ * 사용자 상세 페이지에 표시할 계정 연결 정보.
  *
- * - [identities] — 이 계정에 연결된 로그인 수단 전체 (primary=최초 가입 provider + 링크된 secondary).
- *   통합 안 한 계정은 1개. 사용자 대면 GET /auth/identities 와 동일한 [LinkedIdentity] 를 재사용해
- *   (provider/email/primary) 조립 로직·DTO 가 한 곳([UserRepository.listIdentities])에만 있도록 한다.
- * - [merges] — 이 계정으로 흡수된 다른 계정의 병합 이력 (account_merges). 병합이 없었으면 빈 리스트.
+ * [identities] — 이 계정에 연결된 로그인 수단 전체 (primary=최초 가입 provider + 링크된 secondary).
+ * 통합 안 한 계정은 1개. 사용자 대면 GET /auth/identities 와 동일한 [LinkedIdentity] 를 재사용해
+ * (provider/email/primary) 조립 로직·DTO 가 한 곳([UserRepository.listIdentities])에만 있도록 한다.
+ *
+ * 병합 이력은 [AdminUserCreditsResponse] 타임라인의 'merge_carry' 이벤트가 정본 — 같은
+ * account_merges row 를 두 화면이 각각 렌더하지 않도록 여기서는 노출하지 않는다.
  */
 @Serializable
 data class AdminUserAccount(
     val identities: List<LinkedIdentity>,
-    val merges: List<AdminAccountMerge>,
-)
-
-/**
- * 이 계정으로 흡수된 병합 이벤트 한 건 (account_merges 1 row).
- *
- * - [fromProvider] / [fromEmail] — 흡수돼 사라진 계정의 provider + 이메일.
- * - [carriedCredits] — 이 병합으로 이월된 크레딧 (무료 가입 보너스 제외분. 0 일 수 있음).
- * - [mergedAt] — 병합 시각 (ISO-8601 instant).
- */
-@Serializable
-data class AdminAccountMerge(
-    val fromProvider: String,
-    val fromEmail: String,
-    val carriedCredits: Int,
-    val mergedAt: String,
 )
 
 /**
  * 사용자 상세 페이지의 크레딧 변동 타임라인 한 건. 세 소스(credit_transactions / credit_ledger /
  * account_merges)를 하나의 이벤트 스트림으로 합친 것 — 저장 형태가 아니라 표시용 view 다.
  *
+ * - [id] — "<소스>:<PK>" 형태의 전역 유니크 키 (tx:12 / ledger:34 / merge:5). 정렬 tiebreaker 이자
+ *   클라이언트의 목록 key·중복 제거 키.
  * - [type] — 'signup'(가입 보너스) / 'purchase'(인앱결제) / 'ad_reward'(보상형 광고) /
  *   'admin_grant'(관리자 지급) / 'separation'(음원분리 차감) / 'refund'(분리 실패 환불) /
  *   'merge_carry'(계정 병합 이월).
@@ -113,6 +101,7 @@ data class AdminAccountMerge(
  */
 @Serializable
 data class AdminCreditEvent(
+    val id: String,
     val at: String,
     val type: String,
     val delta: Int,

@@ -263,10 +263,10 @@ class AdminRepositoryTest {
         )
     }
 
-    // ── getUserAccount (연결/병합) ───────────────────────────────────────────
+    // ── getUserAccount (연결된 로그인 수단) ──────────────────────────────────
 
     @Test
-    fun `user account lists identities and is empty of merges for a solo account`() {
+    fun `user account lists the single identity of a solo account`() {
         val solo = users.upsert(AuthProvider.GOOGLE, "g-solo", "solo@example.com", "Solo", null)
 
         val account = admin.getUserAccount(solo.id)
@@ -274,7 +274,6 @@ class AdminRepositoryTest {
         assertEquals("google", account.identities.single().provider)
         assertEquals("solo@example.com", account.identities.single().email)
         assertEquals(true, account.identities.single().primary)
-        assertEquals(emptyList(), account.merges)
     }
 
     @Test
@@ -303,25 +302,17 @@ class AdminRepositoryTest {
     }
 
     @Test
-    fun `user account surfaces merge history with absorbed account and carried credits`() {
-        // A (google): 무료 보너스만. B (apple): 무료 보너스 + 획득 5 → 병합 시 5 이월.
+    fun `user account lists both identities after a merge`() {
+        // 병합 이력 자체(흡수된 계정·이월 크레딧)는 크레딧 타임라인의 merge_carry 가 정본 —
+        // 여기서는 흡수 후 identity 가 둘 다 붙는지만 본다.
         val a = users.upsert(AuthProvider.GOOGLE, "g-a", "a@example.com", "Alice", null)
-        credits.grantSignupBonus(a.id)
         val b = users.upsert(AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
         credits.grantSignupBonus(b.id)
-        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5)
 
         users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
 
         val account = admin.getUserAccount(a.id)
-        // 병합 후 A 는 google(primary) + apple(secondary) 두 identity.
         assertEquals(setOf("google", "apple"), account.identities.map { it.provider }.toSet())
-        // 병합 이력 1건 — 흡수된 apple 계정 + 이월 크레딧 5.
-        assertEquals(1, account.merges.size)
-        val merge = account.merges.single()
-        assertEquals("apple", merge.fromProvider)
-        assertEquals("b@icloud.com", merge.fromEmail)
-        assertEquals(5, merge.carriedCredits)
     }
 
     @Test
@@ -515,6 +506,19 @@ class AdminRepositoryTest {
     }
 
     @Test
+    fun `getUserCredits keeps the event when the referenced separation job is gone`() {
+        // 잡 row 가 사라져도(오래된 잡 정리 등) 차감 이벤트 자체는 남아야 한다 — 잡 ID 는 ledger 의
+        // ref_id 에서 나오므로 그대로 뜨고, 길이만 null.
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        credits.grantSignupBonus(u.id)
+        credits.reserve(u.id, "sep-ghost", 1)
+
+        val event = admin.getUserCredits(u.id, 50, 0).events.single { it.type == "separation" }
+        assertEquals("sep-ghost", event.jobId)
+        assertNull(event.sourceDurationMs)
+    }
+
+    @Test
     fun `getUserCredits paginates newest first and reports the full total`() {
         val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
         val now = Instant.now()
@@ -526,10 +530,13 @@ class AdminRepositoryTest {
         val first = admin.getUserCredits(u.id, 2, 0)
         assertEquals(3L, first.total)
         assertEquals(listOf(3, 2), first.events.map { it.delta })
+        // 페이지 경계가 안정적이려면 이벤트 키가 소스를 가로질러 유니크해야 한다.
+        assertEquals(2, first.events.map { it.id }.toSet().size)
 
         val second = admin.getUserCredits(u.id, 2, 2)
         assertEquals(3L, second.total)
         assertEquals(listOf(1), second.events.map { it.delta })
+        assertTrue(first.events.none { f -> second.events.any { it.id == f.id } }) // 페이지 간 중복 없음
     }
 
     @Test
