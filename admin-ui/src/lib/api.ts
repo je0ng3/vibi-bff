@@ -171,6 +171,32 @@ export interface AdminUserAccount {
   merges: AdminAccountMerge[];
 }
 
+/**
+ * 크레딧 변동 1건. type 은 'signup' | 'purchase' | 'ad_reward' | 'admin_grant' |
+ * 'separation' | 'refund' | 'merge_carry'. delta 는 부호 포함 (분리 차감만 음수).
+ * jobId/sourceDurationMs 는 separation·refund 에서만 채워진다 (잡 row 가 남아있을 때).
+ */
+export interface AdminCreditEvent {
+  at: string;
+  type: string;
+  delta: number;
+  detail: string | null;
+  jobId: string | null;
+  sourceDurationMs: number | null;
+}
+
+/**
+ * 크레딧 타임라인 응답. balance 는 user_credits 의 실제 잔액이고, hasMerges 가 true 면
+ * 이벤트 delta 합계와 일치하지 않을 수 있다 — 병합으로 흡수된 계정의 결제 이력이 감사 보존을
+ * 위해 re-point 되지만 잔액에 더해진 건 이월분뿐이기 때문 (BFF AdminUserCreditsResponse KDoc).
+ */
+export interface AdminUserCreditsResponse {
+  balance: number;
+  events: AdminCreditEvent[];
+  total: number;
+  hasMerges: boolean;
+}
+
 export interface AdminExternalCallDaily {
   date: string;
   provider: string;

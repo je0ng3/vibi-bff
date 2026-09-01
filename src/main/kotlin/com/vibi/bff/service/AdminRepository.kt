@@ -6,6 +6,7 @@ import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminAccountMerge
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
+import com.vibi.bff.model.AdminCreditEvent
 import com.vibi.bff.model.AdminDailyStats
 import com.vibi.bff.model.AdminUserAccount
 import com.vibi.bff.model.AdminDeletionDaily
@@ -17,6 +18,7 @@ import com.vibi.bff.model.AdminJobStatusBreakdown
 import com.vibi.bff.model.AdminOverview
 import com.vibi.bff.model.AdminSignupDaily
 import com.vibi.bff.model.AdminUserJob
+import com.vibi.bff.model.AdminUserCreditsResponse
 import com.vibi.bff.model.AdminUserOverview
 import java.time.Instant
 import java.time.format.DateTimeFormatter
@@ -581,6 +583,114 @@ class AdminRepository(
             }
 
         AdminUserAccount(identities = identities, merges = merges)
+    }
+
+    /**
+     * 사용자 상세 페이지용 — 크레딧 변동 타임라인 (최신순, 페이지네이션).
+     *
+     * 세 소스를 `UNION ALL` 한 뒤 정렬·페이징한다. 소스별로 나눠 조회한 뒤 코틀린에서 합치면
+     * 페이지 경계가 어긋나므로(각각 limit 을 적용하게 됨) 한 쿼리로 뽑는다:
+     *   • credit_transactions — purchase / ad_reward(admob) / admin_grant(admin)
+     *   • credit_ledger       — signup / separation(consume, 음수) / refund
+     *   • account_merges      — merge_carry (이월 크레딧)
+     *
+     * consume/refund 의 ref_id 는 "consume-<jobId>" / "refund-<jobId>" 라 접두사를 떼고
+     * separation_jobs(TEXT PK) 와 LEFT JOIN 해 입력 길이를 붙인다 — "몇 분짜리 분리로 몇 개
+     * 차감" 표시용. 잡 row 가 없으면(오래된 잡·탈퇴 익명화) 길이만 null 이고 이벤트는 남는다.
+     *
+     * 반환 [AdminUserCreditsResponse.balance] 와 이벤트 delta 합계가 어긋날 수 있는 이유는
+     * 해당 DTO 의 KDoc 참조 (계정 병합의 re-point). hasMerges 로 UI 가 경고를 띄운다.
+     */
+    fun getUserCredits(userId: UUID, limit: Int, offset: Int): AdminUserCreditsResponse = transaction {
+        require(limit in 1..200) { "limit must be in 1..200 (got $limit)" }
+        require(offset >= 0) { "offset must be >= 0 (got $offset)" }
+
+        // user_credits row 가 없는 사용자(보너스 지급 전/이력 없음)도 0 으로 떨어지도록 스칼라
+        // 서브쿼리 + COALESCE — scalarLong 은 결과 row 가 없으면 JDBC 레벨에서 터진다.
+        val balance = scalarLong(
+            "SELECT COALESCE((SELECT balance FROM user_credits WHERE user_id = ?), 0)",
+            listOf(uuidArg(userId)),
+        ).toInt()
+        val mergeCount = scalarLong(
+            "SELECT COUNT(*) FROM account_merges WHERE into_account_id = ?",
+            listOf(uuidArg(userId)),
+        )
+        val total = mergeCount + scalarLong(
+            """
+                SELECT (SELECT COUNT(*) FROM credit_transactions WHERE user_id = ?)
+                     + (SELECT COUNT(*) FROM credit_ledger WHERE user_id = ?)
+            """.trimIndent(),
+            listOf(uuidArg(userId), uuidArg(userId)),
+        )
+
+        // 'day' 처럼 예약어 충돌을 피하려 별칭은 at/ev_type 사용. NULL 컬럼은 UNION 의 타입
+        // 결정을 위해 CAST 필수 (H2 는 캐스트 없는 NULL 컬럼의 UNION 을 거부).
+        val sql = """
+            SELECT at, ev_type, delta, detail, job_id, source_duration_ms
+            FROM (
+                SELECT ct.created_at AS at,
+                       CASE ct.platform
+                           WHEN 'admob' THEN 'ad_reward'
+                           WHEN 'admin' THEN 'admin_grant'
+                           ELSE 'purchase'
+                       END AS ev_type,
+                       ct.credits AS delta,
+                       ct.product_id AS detail,
+                       CAST(NULL AS VARCHAR) AS job_id,
+                       CAST(NULL AS BIGINT) AS source_duration_ms
+                FROM credit_transactions ct
+                WHERE ct.user_id = ?
+                UNION ALL
+                SELECT cl.created_at,
+                       CASE cl.kind WHEN 'consume' THEN 'separation' ELSE cl.kind END,
+                       CASE WHEN cl.kind = 'consume' THEN -cl.credits ELSE cl.credits END,
+                       CAST(NULL AS VARCHAR),
+                       sj.id,
+                       sj.source_duration_ms
+                FROM credit_ledger cl
+                LEFT JOIN separation_jobs sj ON sj.id = CASE cl.kind
+                    WHEN 'consume' THEN SUBSTRING(cl.ref_id, 9)
+                    WHEN 'refund' THEN SUBSTRING(cl.ref_id, 8)
+                    ELSE NULL
+                END
+                WHERE cl.user_id = ?
+                UNION ALL
+                SELECT am.merged_at,
+                       'merge_carry',
+                       am.carried_credits,
+                       am.from_provider || ':' || am.from_email,
+                       CAST(NULL AS VARCHAR),
+                       CAST(NULL AS BIGINT)
+                FROM account_merges am
+                WHERE am.into_account_id = ?
+            ) e
+            ORDER BY at DESC, ev_type ASC, delta ASC
+            LIMIT ? OFFSET ?
+        """.trimIndent()
+
+        val events = mutableListOf<AdminCreditEvent>()
+        TransactionManager.current().exec(sql, args = listOf(
+            uuidArg(userId), uuidArg(userId), uuidArg(userId), intArg(limit), intArg(offset),
+        )) { rs ->
+            while (rs.next()) {
+                val durationMs = rs.getLong("source_duration_ms").takeIf { !rs.wasNull() }
+                events += AdminCreditEvent(
+                    at = DateTimeFormatter.ISO_INSTANT.format(rs.getTimestamp("at").toInstant()),
+                    type = rs.getString("ev_type"),
+                    delta = rs.getInt("delta"),
+                    detail = rs.getString("detail"),
+                    jobId = rs.getString("job_id"),
+                    sourceDurationMs = durationMs,
+                )
+            }
+        }
+
+        AdminUserCreditsResponse(
+            balance = balance,
+            events = events,
+            total = total,
+            hasMerges = mergeCount > 0,
+        )
     }
 
     /**

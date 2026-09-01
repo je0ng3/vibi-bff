@@ -145,13 +145,7 @@ fun Route.adminRoutes(
         // 사용자별 render 잡 + 영상 당 분리 횟수.
         get("/users/{userId}/jobs") {
             call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val (limit, offset) = call.parsePagination()
             val (rows, total) = withContext(Dispatchers.IO) {
                 adminRepository.getUserJobs(userId, limit, offset)
@@ -162,14 +156,20 @@ fun Route.adminRoutes(
         // 사용자별 계정 연결/병합 정보 — 연결된 로그인 수단 + 이 계정으로 흡수된 병합 이력(이월 크레딧).
         get("/users/{userId}/account") {
             call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val data = withContext(Dispatchers.IO) { adminRepository.getUserAccount(userId) }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 사용자별 크레딧 변동 타임라인 — 가입 보너스/구매/광고/관리자 지급/분리 차감/환불/
+        // 병합 이월을 한 스트림으로 (최신순, limit·offset 공유 규약).
+        get("/users/{userId}/credits") {
+            call.requireAdmin(jwtSecret)
+            val userId = call.parseUserId()
+            val (limit, offset) = call.parsePagination()
+            val data = withContext(Dispatchers.IO) {
+                adminRepository.getUserCredits(userId, limit, offset)
+            }
             call.respond(HttpStatusCode.OK, data)
         }
 
@@ -178,13 +178,7 @@ fun Route.adminRoutes(
         // JWT 는 발급 시점 role 을 쓰므로 대상 사용자는 재로그인 후 반영 (AdminRepository.setUserRole 참조).
         post("/users/{userId}/role") {
             val principal = call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val body = call.receive<AdminSetRoleRequest>()
             if (body.role != "admin" && body.role != "user") {
                 throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_role")
@@ -232,6 +226,19 @@ fun Route.adminRoutes(
             adminLog.info("rejoin block lifted by admin: hash={} removed={}", hash.take(12), unblocked)
             call.respond(HttpStatusCode.OK, AdminUnblockRejoinResponse(unblocked = unblocked))
         }
+    }
+}
+
+/**
+ * `{userId}` path 파라미터를 UUID 로 파싱. 누락은 404, 형식 오류는 400 `invalid_user_id`.
+ * `/users/{userId}/...` 하위 핸들러들이 공유.
+ */
+private fun ApplicationCall.parseUserId(): UUID {
+    val raw = parameters["userId"] ?: throw NotFoundException("userId required")
+    return try {
+        UUID.fromString(raw)
+    } catch (e: IllegalArgumentException) {
+        throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
     }
 }
 

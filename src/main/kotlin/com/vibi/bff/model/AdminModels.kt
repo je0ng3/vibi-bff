@@ -99,6 +99,47 @@ data class AdminAccountMerge(
 )
 
 /**
+ * 사용자 상세 페이지의 크레딧 변동 타임라인 한 건. 세 소스(credit_transactions / credit_ledger /
+ * account_merges)를 하나의 이벤트 스트림으로 합친 것 — 저장 형태가 아니라 표시용 view 다.
+ *
+ * - [type] — 'signup'(가입 보너스) / 'purchase'(인앱결제) / 'ad_reward'(보상형 광고) /
+ *   'admin_grant'(관리자 지급) / 'separation'(음원분리 차감) / 'refund'(분리 실패 환불) /
+ *   'merge_carry'(계정 병합 이월).
+ * - [delta] — 부호 포함 변동량. 차감(separation)만 음수, 나머지는 양수 (병합 이월은 0 일 수 있다).
+ * - [detail] — 타입별 보조 표시값. purchase/ad_reward/admin_grant 는 product_id,
+ *   merge_carry 는 "provider:email" (흡수된 계정). 없으면 null.
+ * - [jobId] / [sourceDurationMs] — separation·refund 에서 해당 분리 잡과 입력 길이.
+ *   잡 row 가 이미 사라졌거나(탈퇴 익명화) 다른 타입이면 null.
+ */
+@Serializable
+data class AdminCreditEvent(
+    val at: String,
+    val type: String,
+    val delta: Int,
+    val detail: String? = null,
+    val jobId: String? = null,
+    val sourceDurationMs: Long? = null,
+)
+
+/**
+ * 사용자 크레딧 타임라인 응답.
+ *
+ * [balance] 는 user_credits 의 실제 잔액이고, [events] 의 delta 합계와 **일치하지 않을 수 있다** —
+ * 계정 병합이 있었던 경우 흡수된 계정 B 의 결제 이력(credit_transactions)은 감사 보존을 위해 A 로
+ * re-point 되지만 A 의 잔액에 더해진 건 carry(min(B.잔액, B.획득분)) 뿐이고, B 의 소비 이력
+ * (credit_ledger)은 의도적으로 orphan 되기 때문이다 (UserRepository.mergeAccounts 참조).
+ * re-point 된 row 를 A 자신의 결제와 구분할 컬럼이 없어 소급 보정도 불가능하다. 따라서 UI 는
+ * 잔액을 [balance] 로만 표시하고, [hasMerges] 가 true 면 "합계와 잔액이 다를 수 있음" 을 알린다.
+ */
+@Serializable
+data class AdminUserCreditsResponse(
+    val balance: Int,
+    val events: List<AdminCreditEvent>,
+    val total: Long,
+    val hasMerges: Boolean,
+)
+
+/**
  * 대시보드 상단 KPI 카드. 전체 누적 + 최근 7일 비교 같은 단일 숫자 시리즈.
  * separation 은 클라이언트별 분해 포함 (mobile + plugin = total). render 는 모바일 전용.
  */

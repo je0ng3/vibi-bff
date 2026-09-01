@@ -5,6 +5,7 @@ import com.vibi.bff.db.DbBootstrap
 import com.vibi.bff.model.AuthProvider
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.CreditRepository
+import com.vibi.bff.service.SIGNUP_BONUS_CREDITS
 import com.vibi.bff.service.UserRepository
 import com.zaxxer.hikari.HikariDataSource
 import java.time.Instant
@@ -13,6 +14,8 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -453,5 +456,101 @@ class AdminRepositoryTest {
         assertEquals(0, stats.totalDeletions)
         assertEquals(0.0, stats.avgTenureDays)
         assertEquals(0.0, stats.medianTenureDays)
+    }
+
+    // ── getUserCredits (크레딧 변동 타임라인) ─────────────────────────────────
+
+    /** [insertSeparationJob] 과 달리 생성한 잡 ID 를 돌려준다 — reserve/refund 의 ref_id 조립용. */
+    private fun insertSeparationJobReturningId(userId: UUID, durationMs: Long): String {
+        val id = "sep-" + UUID.randomUUID()
+        transaction {
+            exec(
+                "INSERT INTO separation_jobs (id, user_id, source_duration_ms, status, client) " +
+                    "VALUES ('$id', CAST('$userId' AS UUID), $durationMs, 'READY', 'mobile')",
+            )
+        }
+        return id
+    }
+
+    @Test
+    fun `getUserCredits merges grants consumption and refunds into one timeline`() {
+        allowAdminPlatformInH2()
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        credits.grantSignupBonus(u.id)
+        credits.grantPurchase(u.id, "google", "tx-1", "vibi.credits.10", 10)
+        // 광고/관리자 지급은 platform 만 다른 같은 테이블 — 잔액엔 영향 없이 이벤트 종류만 확인.
+        insertTxn(u.id, "admob", "ssv-1", 1, Instant.now())
+        insertTxn(u.id, "admin", "grant-1", 7, Instant.now())
+        val jobId = insertSeparationJobReturningId(u.id, 252_000)
+        credits.reserve(u.id, jobId, 5)
+
+        val res = admin.getUserCredits(u.id, 50, 0)
+
+        assertEquals(5, res.events.size)
+        assertEquals(5L, res.total)
+        assertEquals(SIGNUP_BONUS_CREDITS + 10 - 5, res.balance)
+        assertTrue(!res.hasMerges)
+
+        val byType = res.events.associateBy { it.type }
+        assertEquals(SIGNUP_BONUS_CREDITS, byType.getValue("signup").delta)
+        assertEquals(10, byType.getValue("purchase").delta)
+        assertEquals(1, byType.getValue("ad_reward").delta)
+        assertEquals(7, byType.getValue("admin_grant").delta)
+
+        // 분리 차감만 음수 + 잡 ID/입력 길이가 붙어 "몇 분짜리로 몇 개 차감" 을 표시할 수 있다.
+        val consumed = byType.getValue("separation")
+        assertEquals(-5, consumed.delta)
+        assertEquals(jobId, consumed.jobId)
+        assertEquals(252_000L, consumed.sourceDurationMs)
+        // 결제 이벤트엔 product_id 가, 차감엔 detail 이 없다.
+        assertEquals("vibi.credits.10", byType.getValue("purchase").detail)
+        assertNull(consumed.detail)
+
+        // 잡 실패 환불도 같은 잡을 가리키는 별도 이벤트로 뜬다.
+        credits.refund(jobId)
+        val refunded = admin.getUserCredits(u.id, 50, 0).events.single { it.type == "refund" }
+        assertEquals(5, refunded.delta)
+        assertEquals(jobId, refunded.jobId)
+        assertEquals(252_000L, refunded.sourceDurationMs)
+    }
+
+    @Test
+    fun `getUserCredits paginates newest first and reports the full total`() {
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        val now = Instant.now()
+        // 시각을 명시 제어해 정렬을 결정적으로 — 같은 밀리초에 몰리면 순서 단정이 불안정하다.
+        insertTxn(u.id, "google", "tx-old", 1, now.minusSeconds(300))
+        insertTxn(u.id, "google", "tx-mid", 2, now.minusSeconds(200))
+        insertTxn(u.id, "google", "tx-new", 3, now.minusSeconds(100))
+
+        val first = admin.getUserCredits(u.id, 2, 0)
+        assertEquals(3L, first.total)
+        assertEquals(listOf(3, 2), first.events.map { it.delta })
+
+        val second = admin.getUserCredits(u.id, 2, 2)
+        assertEquals(3L, second.total)
+        assertEquals(listOf(1), second.events.map { it.delta })
+    }
+
+    @Test
+    fun `getUserCredits surfaces merge carry and flags that the sum may not match the balance`() {
+        val a = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = users.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id)
+        credits.grantPurchase(b.id, "google", "earn-1", "vibi.credits.5", 5)
+        users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+
+        val res = admin.getUserCredits(a.id, 50, 0)
+
+        assertTrue(res.hasMerges)
+        val carry = res.events.single { it.type == "merge_carry" }
+        assertEquals(5, carry.delta) // 무료 보너스 제외, 획득분만 이월
+        assertEquals("apple:a@icloud.com", carry.detail)
+
+        // B 의 결제 row 가 감사 보존을 위해 A 로 re-point 되므로 타임라인엔 구매(+5)와 이월(+5)이
+        // 둘 다 보이지만 실제 잔액 증가는 carry 5 뿐 — hasMerges 가 이 괴리를 UI 에 알린다.
+        assertEquals(SIGNUP_BONUS_CREDITS + 5, res.balance)
+        assertTrue(res.events.sumOf { it.delta } > res.balance)
     }
 }
