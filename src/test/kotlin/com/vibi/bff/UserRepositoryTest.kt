@@ -272,7 +272,7 @@ class UserRepositoryTest {
         assertEquals(SIGNUP_BONUS_CREDITS + 5, credits.balance(b.id))
 
         val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
-        // 무료 보너스(10)는 중복 이월 안 됨 — 획득분(5)만 합산.
+        // 무료 보너스는 중복 이월 안 됨 — 획득분(5)만 합산.
         assertTrue(outcome is UserRepository.LinkOutcome.Merged)
         val merged = outcome as UserRepository.LinkOutcome.Merged
         assertEquals(5, merged.carriedCredits)
@@ -290,6 +290,25 @@ class UserRepositoryTest {
                 .single()[CreditTransactionsTable.userId]
         }
         assertEquals(a.id, txOwner)
+    }
+
+    @Test
+    fun `linkOrMerge carries nothing when the absorbed account has only the free signup bonus`() {
+        // 보너스 파밍 회귀 가드: 2번째 계정을 새로 만들어 무료 보너스만 받은 뒤 병합해도
+        // 이월분은 0 이어야 한다 (earned=0 → carry=min(balance, 0)=0).
+        val credits = CreditRepository()
+        val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id)
+        assertEquals(SIGNUP_BONUS_CREDITS, credits.balance(b.id))
+
+        val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+            as UserRepository.LinkOutcome.Merged
+
+        assertEquals(0, outcome.carriedCredits)
+        assertEquals(SIGNUP_BONUS_CREDITS, outcome.newBalance)
+        assertEquals(SIGNUP_BONUS_CREDITS, credits.balance(a.id)) // 보너스 2배 아님
     }
 
     @Test
