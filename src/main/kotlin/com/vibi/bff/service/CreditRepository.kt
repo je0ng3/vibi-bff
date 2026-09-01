@@ -16,9 +16,12 @@ import org.jetbrains.exposed.sql.upsert
 
 /**
  * 신규 가입 시 자동 지급되는 보너스 크레딧. 크레딧당 1분 분리([CreditCost.BILLABLE_BLOCK_MS])
- * 이므로 10 크레딧 = 첫 사용 무료 10분. 변경 시 모바일 카피 + App Store 설명문도 함께 갱신.
+ * 이므로 3 크레딧 = 첫 사용 무료 3분. 변경 시 모바일 카피 + App Store 설명문도 함께 갱신.
+ *
+ * 값 변경은 **신규 가입자에게만** 적용된다 — 기존 사용자 잔액은 소급 조정하지 않는다
+ * (10 → 3 하향 시 이미 지급된 분을 회수하지 않음).
  */
-const val SIGNUP_BONUS_CREDITS: Int = 10
+const val SIGNUP_BONUS_CREDITS: Int = 3
 
 /**
  * 잔액 부족 시 [CreditRepository.reserve] 가 throw. 라우트가 잡아 402 (Payment Required) 로 매핑.
