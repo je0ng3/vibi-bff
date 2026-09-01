@@ -338,9 +338,10 @@ class UserRepositoryTest {
         val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
         credits.grantSignupBonus(a.id)
         val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
-        credits.grantSignupBonus(b.id) // +10 free
-        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned → balance 15
-        credits.reserve(b.id, "job-1", 12) // -12 → balance 3, earned(credit_transactions) 여전히 5
+        credits.grantSignupBonus(b.id) // + 무료 보너스
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned
+        // 잔액이 earned(5) 보다 적게 3 만 남도록 예약 — 보너스 상수 변경에 무관하게 재현.
+        credits.reserve(b.id, "job-1", SIGNUP_BONUS_CREDITS + 2)
 
         val outcome = repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null) as UserRepository.LinkOutcome.Merged
         // carry = min(balance=3, earned=5) = 3.
@@ -355,19 +356,19 @@ class UserRepositoryTest {
         // re-point 하지 않으므로 orphan 된 consume 의 환불은 no-op 여야 한다.
         val credits = CreditRepository()
         val a = repo.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
-        credits.grantSignupBonus(a.id) // A balance = 10
+        credits.grantSignupBonus(a.id) // A balance = 보너스
         val b = repo.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
-        credits.grantSignupBonus(b.id) // +10 free
-        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned → balance 15
-        credits.reserve(b.id, "job-1", 12) // in-flight 잡: -12 → balance 3
+        credits.grantSignupBonus(b.id) // + 무료 보너스
+        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5) // +5 earned
+        credits.reserve(b.id, "job-1", SIGNUP_BONUS_CREDITS + 2) // in-flight 잡 → balance 3
 
         repo.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null) // carry=min(3,5)=3
-        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id)) // 13
+        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id))
 
         // 병합 후 B 의 잡이 실패 → 환불 콜백. orphan 된 consume 라 A 잔액은 변하지 않아야 한다.
         val refunded = credits.refund("job-1")
         assertNull(refunded) // consume.user_id 가 NULL → refund no-op
-        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id)) // 여전히 13 (25 아님 = 누수 없음)
+        assertEquals(SIGNUP_BONUS_CREDITS + 3, credits.balance(a.id)) // 예약분이 A 로 환불되지 않음 = 누수 없음
     }
 
     @Test
