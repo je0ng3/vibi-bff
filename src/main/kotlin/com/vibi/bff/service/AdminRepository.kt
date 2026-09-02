@@ -1,9 +1,12 @@
 package com.vibi.bff.service
 
+import com.vibi.bff.db.AdminAuditLogTable
 import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminActiveJob
 import com.vibi.bff.model.AdminAdStats
+import com.vibi.bff.model.AdminAuditEntry
+import com.vibi.bff.model.AdminAuditResponse
 import com.vibi.bff.model.AdminCreditEvent
 import com.vibi.bff.model.AdminDailyStats
 import com.vibi.bff.model.AdminUserAccount
@@ -25,6 +28,7 @@ import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.IntegerColumnType
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.UUIDColumnType
+import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -48,6 +52,16 @@ private fun scalarLong(sql: String, args: List<Pair<IColumnType<*>, Any?>> = emp
 /** 소수 첫째 자리 반올림 — 체류기간(일) 표시용. */
 private fun round1(v: Double): Double = Math.round(v * 10.0) / 10.0
 
+/**
+ * `admin_audit_log.action` 값. 컬럼별 의미는 action 마다 다르다 —
+ * [AdminRepository.recordAudit] KDoc + V19 마이그레이션 주석 참조.
+ */
+object AdminAuditAction {
+    const val CREDIT_GRANT = "credit_grant"
+    const val SET_ROLE = "set_role"
+    const val UNBLOCK_REJOIN = "unblock_rejoin"
+}
+
 /** 정렬 후 중앙값. 짝수개면 가운데 두 값의 평균. 빈 리스트는 호출측에서 가드. */
 private fun medianOf(values: List<Long>): Double {
     val sorted = values.sorted()
@@ -57,13 +71,15 @@ private fun medianOf(values: List<Long>): Double {
 }
 
 /**
- * admin 대시보드용 read-only 쿼리. mutating action 없음 (v1 의도적 제외).
+ * admin 대시보드 쿼리. 대부분 read-only 집계이고, mutating 은 [setUserRole] 과 재가입 차단
+ * 해제뿐이다. mutating 액션은 전부 `admin_audit_log` 에 흔적을 남긴다.
  *
- * 모든 쿼리는 raw SQL — Exposed 의 group-by/aggregation API 로도 가능하나 raw 가 가독성 우위.
+ * 집계 쿼리는 raw SQL — Exposed 의 group-by/aggregation API 로도 가능하나 raw 가 가독성 우위.
  * Postgres + H2 (PostgreSQL mode) 양쪽에서 동일 구문이 동작하는지 확인된 SQL 만 사용.
+ * (INSERT/UPDATE 는 반대로 Exposed DSL — 타입 안전 + 갱신 row 수를 그대로 받는다.)
  */
 class AdminRepository(
-    /** identity 조립을 사용자 대면 경로와 공유하기 위한 의존성 ([getUserAccount] 만 사용). */
+    /** 사용자 대면 경로와 로직을 공유하기 위한 의존성 ([getUserAccount] · [unblockRejoinAudited]). */
     private val userRepository: UserRepository,
 ) {
 
@@ -746,6 +762,124 @@ class AdminRepository(
             it[UsersTable.role] = role
             it[UsersTable.updatedAt] = Instant.now()
         }
+    }
+
+    /**
+     * role 변경 + 감사 기록을 한 트랜잭션으로. 갱신 row 수(0 = 존재하지 않는 사용자) 반환.
+     * 변경만 커밋되고 감사 기록이 유실되는 창을 없앤다.
+     */
+    fun setUserRoleAudited(userId: UUID, actorUserId: UUID, role: String): Int = transaction {
+        val updated = setUserRole(userId, role)
+        if (updated > 0) {
+            recordAudit(
+                actorUserId = actorUserId,
+                action = AdminAuditAction.SET_ROLE,
+                targetUserId = userId,
+                detail = role,
+            )
+        }
+        updated
+    }
+
+    /**
+     * 재가입 차단 해제 + 감사 기록을 한 트랜잭션으로. 실제로 지운 경우만 기록한다 — 이미
+     * 해제/만료된 대상의 재클릭까지 남기면 로그가 흐려진다.
+     *
+     * 대상은 탈퇴자라 users row 가 없다 → target_user_id 는 null 이고 detail 에 identity 해시를 담는다.
+     */
+    fun unblockRejoinAudited(identityHash: String, actorUserId: UUID): Boolean = transaction {
+        val removed = userRepository.unblockRejoin(identityHash)
+        if (removed) {
+            recordAudit(
+                actorUserId = actorUserId,
+                action = AdminAuditAction.UNBLOCK_REJOIN,
+                detail = identityHash,
+            )
+        }
+        removed
+    }
+
+    /**
+     * 감사 로그 1건 적재 (append-only). [actorUserId] 의 이메일은 지금 조회해 denormalize —
+     * 운영자 계정이 나중에 삭제돼도 "누가 했는지" 가 남는다 (삭제 정책의 의도적 예외. V19 주석 참조).
+     *
+     * **직접 호출보다 액션별 래퍼를 쓸 것** ([setUserRoleAudited] · [unblockRejoinAudited]) —
+     * 변경과 기록이 한 트랜잭션으로 묶여야 "변경은 됐는데 기록은 없는" 상태가 생기지 않는다.
+     * 이 메서드는 그 래퍼들이 쓰는 프리미티브다.
+     *
+     * action 별 컬럼 의미:
+     *   • credit_grant   — [targetUserId]=수령자, [amount]=지급 크레딧, [detail]=사유, [creditTransactionId] 채움
+     *   • set_role       — [targetUserId]=대상, [detail]=새 role
+     *   • unblock_rejoin — [targetUserId]=null (탈퇴자), [detail]=identity 해시
+     *
+     * 중첩 호출 안전 — Exposed 는 열린 트랜잭션이 있으면 그것을 재사용한다 ([grantCredits] 가
+     * 자기 트랜잭션 안에서 호출).
+     */
+    fun recordAudit(
+        actorUserId: UUID,
+        action: String,
+        targetUserId: UUID? = null,
+        amount: Int? = null,
+        detail: String? = null,
+        creditTransactionId: Long? = null,
+        now: Instant = Instant.now(),
+    ) {
+        transaction {
+            val actorEmail = UsersTable
+                .select(UsersTable.email)
+                .where { UsersTable.id eq actorUserId }
+                .singleOrNull()
+                ?.get(UsersTable.email)
+                ?: "unknown"
+            AdminAuditLogTable.insert {
+                it[AdminAuditLogTable.actorUserId] = actorUserId
+                it[AdminAuditLogTable.actorEmail] = actorEmail
+                it[AdminAuditLogTable.action] = action
+                it[AdminAuditLogTable.targetUserId] = targetUserId
+                it[AdminAuditLogTable.amount] = amount
+                // detail 컬럼은 varchar(500) — 라우트가 이미 길이를 검증하지만 DB 제약 위반으로
+                // 500 이 나는 것보다 잘라서 기록하는 편이 감사 로그의 목적에 맞다.
+                it[AdminAuditLogTable.detail] = detail?.take(500)
+                it[AdminAuditLogTable.creditTransactionId] = creditTransactionId
+                it[AdminAuditLogTable.createdAt] = now
+            }
+        }
+    }
+
+    /**
+     * 감사 로그 페이지 (최신순) + 전체 건수. 대상 이메일은 현재 users row 에서 채우므로
+     * 탈퇴한 사용자는 null 로 뜬다 (감사 row 자체는 FK SET NULL 로 남는다).
+     */
+    fun listAudit(limit: Int, offset: Int): AdminAuditResponse = transaction {
+        require(limit in 1..200) { "limit must be in 1..200 (got $limit)" }
+        require(offset >= 0) { "offset must be >= 0 (got $offset)" }
+
+        val total = scalarLong("SELECT COUNT(*) FROM admin_audit_log")
+        val sql = """
+            SELECT a.id, a.created_at, a.actor_email, a.action, a.target_user_id,
+                   u.email AS target_email, a.amount, a.detail
+            FROM admin_audit_log a
+            LEFT JOIN users u ON u.id = a.target_user_id
+            ORDER BY a.created_at DESC, a.id DESC
+            LIMIT ? OFFSET ?
+        """.trimIndent()
+        val entries = mutableListOf<AdminAuditEntry>()
+        TransactionManager.current().exec(sql, args = listOf(intArg(limit), intArg(offset))) { rs ->
+            while (rs.next()) {
+                val amount = rs.getInt("amount").takeIf { !rs.wasNull() }
+                entries += AdminAuditEntry(
+                    id = rs.getLong("id"),
+                    at = DateTimeFormatter.ISO_INSTANT.format(rs.getTimestamp("created_at").toInstant()),
+                    actorEmail = rs.getString("actor_email"),
+                    action = rs.getString("action"),
+                    targetUserId = rs.getString("target_user_id"),
+                    targetEmail = rs.getString("target_email"),
+                    amount = amount,
+                    detail = rs.getString("detail"),
+                )
+            }
+        }
+        AdminAuditResponse(entries = entries, total = total)
     }
 
     /**

@@ -279,3 +279,24 @@ export interface AdminBlockedRejoinsResponse {
 export interface AdminUnblockRejoinResponse {
   unblocked: boolean;
 }
+
+/**
+ * 감사 로그 1건. action 별로 컬럼 의미가 다르다 —
+ * credit_grant(amount=지급 크레딧, detail=사유) / set_role(detail=새 role) /
+ * unblock_rejoin(detail=identity 해시, targetEmail 없음).
+ */
+export interface AdminAuditEntry {
+  id: number;
+  at: string;
+  actorEmail: string;
+  action: string;
+  targetUserId: string | null;
+  targetEmail: string | null;
+  amount: number | null;
+  detail: string | null;
+}
+
+export interface AdminAuditResponse {
+  entries: AdminAuditEntry[];
+  total: number;
+}

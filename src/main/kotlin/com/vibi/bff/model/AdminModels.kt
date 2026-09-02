@@ -278,6 +278,34 @@ data class AdminSetRoleRequest(
 )
 
 /**
+ * 감사 로그 1건 (`admin_audit_log`). 컬럼 의미가 [action] 별로 다르다:
+ *
+ * - `credit_grant`   — [targetEmail] 에게 [amount] 크레딧 지급, [detail] = 사유
+ * - `set_role`       — [targetEmail] 의 role 을 [detail] 로 변경
+ * - `unblock_rejoin` — 재가입 차단 해제. 대상이 탈퇴자라 [targetEmail] 은 null, [detail] = identity 해시
+ *
+ * [actorEmail] 은 지급 시점에 denormalize 된 값 — 운영자 계정이 나중에 삭제돼도 남는다.
+ * [targetEmail] 은 현재 users row 에서 조회하므로 대상이 탈퇴하면 null 이 된다.
+ */
+@Serializable
+data class AdminAuditEntry(
+    val id: Long,
+    val at: String,
+    val actorEmail: String,
+    val action: String,
+    val targetUserId: String? = null,
+    val targetEmail: String? = null,
+    val amount: Int? = null,
+    val detail: String? = null,
+)
+
+@Serializable
+data class AdminAuditResponse(
+    val entries: List<AdminAuditEntry>,
+    val total: Long,
+)
+
+/**
  * 잡 성공/실패 분해 — Overview 의 status 무관 COUNT(*) 가 가리지 못하는 "실제로 동작하는가".
  *
  * 성공 status 가 잡 종류마다 다름: render=COMPLETED, separation=READY. 실패는 둘 다 FAILED.

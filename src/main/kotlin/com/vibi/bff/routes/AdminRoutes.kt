@@ -32,11 +32,13 @@ import org.slf4j.LoggerFactory
 private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
 /**
- * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
+ * `/api/v2/admin/...` — 운영자 대시보드 surface. 모든 라우트 진입 시 [requireAdmin] 으로
  * role=admin JWT 강제. URL slug 숨김 (landing middleware) + role 검사 이중 방어.
  *
- * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). 유일한 mutating action 은 사용자 role
- * 승격/강등 (`POST /users/{userId}/role`) — 운영자가 일반 사용자를 admin 으로 올린다.
+ * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). mutating 은 둘 — role 승격/강등
+ * (`POST /users/{userId}/role`), 재가입 차단 해제 (`POST /blocked-rejoins/{hash}/unblock`).
+ * 둘 다 `admin_audit_log` 에 흔적을 남기고 `GET /audit` 로 열람한다 — 운영자 권한 오남용의
+ * 사후 추적 경로.
  *
  * 주의 — KDoc 안에 slash + asterisk 시퀀스는 nested comment 로 파싱돼 컴파일 깨짐.
  * 와일드카드 표현 필요 시 "..." 으로 대체.
@@ -173,7 +175,7 @@ fun Route.adminRoutes(
             call.respond(HttpStatusCode.OK, data)
         }
 
-        // 사용자 role 승격/강등 — 유일한 mutating admin 액션. body {role: 'admin'|'user'}.
+        // 사용자 role 승격/강등. body {role: 'admin'|'user'}.
         // 자기 자신 role 변경은 차단 (마지막 운영자 자가 강등에 의한 lockout 방지 + 오조작 방어).
         // JWT 는 발급 시점 role 을 쓰므로 대상 사용자는 재로그인 후 반영 (AdminRepository.setUserRole 참조).
         post("/users/{userId}/role") {
@@ -187,10 +189,18 @@ fun Route.adminRoutes(
                 throw ApiErrorException(HttpStatusCode.BadRequest, "cannot_change_own_role")
             }
             val updated = withContext(Dispatchers.IO) {
-                adminRepository.setUserRole(userId, body.role)
+                adminRepository.setUserRoleAudited(userId, principal.userId, body.role)
             }
             if (updated == 0) throw NotFoundException("user not found")
             call.respond(HttpStatusCode.OK, AdminSetRoleRequest(role = body.role))
+        }
+
+        // 운영자 액션 감사 로그 (최신순) — 크레딧 지급 / role 변경 / 재가입 차단 해제.
+        get("/audit") {
+            call.requireAdmin(jwtSecret)
+            val (limit, offset) = call.parsePagination()
+            val data = withContext(Dispatchers.IO) { adminRepository.listAudit(limit, offset) }
+            call.respond(HttpStatusCode.OK, data)
         }
 
         // 탈퇴 후 재가입이 막혀 있는 identity 목록. PII 없음 — provider + 시각만으로 대상 특정.
@@ -215,14 +225,17 @@ fun Route.adminRoutes(
         // 차단 해제 — 실수 탈퇴 복구 / 앱 심사자 잠금 해제. 해제 즉시 재가입 가능해진다.
         // DELETE 대신 POST 인 이유: admin UI 의 mutating 액션이 모두 POST 규약(adminPost) 이다.
         post("/blocked-rejoins/{identityHash}/unblock") {
-            call.requireAdmin(jwtSecret)
+            val principal = call.requireAdmin(jwtSecret)
             val hash = call.parameters["identityHash"]
                 ?: throw NotFoundException("identityHash required")
             // PK 는 SHA-256 hex 64자 — 형식이 다르면 조회할 것도 없다.
             if (!hash.matches(Regex("[0-9a-f]{64}"))) {
                 throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_identity_hash")
             }
-            val unblocked = withContext(Dispatchers.IO) { userRepository.unblockRejoin(hash) }
+            // 해제와 감사 기록은 한 트랜잭션 (AdminRepository.unblockRejoinAudited).
+            val unblocked = withContext(Dispatchers.IO) {
+                adminRepository.unblockRejoinAudited(hash, principal.userId)
+            }
             adminLog.info("rejoin block lifted by admin: hash={} removed={}", hash.take(12), unblocked)
             call.respond(HttpStatusCode.OK, AdminUnblockRejoinResponse(unblocked = unblocked))
         }

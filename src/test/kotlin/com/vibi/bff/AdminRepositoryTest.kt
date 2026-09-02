@@ -560,4 +560,24 @@ class AdminRepositoryTest {
         assertEquals(SIGNUP_BONUS_CREDITS + 5, res.balance)
         assertTrue(res.events.sumOf { it.delta } > res.balance)
     }
+
+    // ── 감사 로그 ────────────────────────────────────────────────────────────
+
+    @Test
+    fun `listAudit returns newest first across action types`() {
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val target = users.upsert(AuthProvider.GOOGLE, "g-user", "u@example.com", "User", null)
+
+        admin.setUserRoleAudited(target.id, actor.id, "admin")
+        // 대상이 사용자 row 가 아닌 액션 — target 은 비고 detail 에 해시만 남는다.
+        admin.recordAudit(actor.id, "unblock_rejoin", detail = "a".repeat(64))
+
+        val res = admin.listAudit(50, 0)
+        assertEquals(2, res.total)
+        assertEquals(listOf("unblock_rejoin", "set_role"), res.entries.map { it.action })
+        val unblock = res.entries.first()
+        assertNull(unblock.targetUserId)
+        assertNull(unblock.targetEmail)
+        assertNull(unblock.amount)
+    }
 }
