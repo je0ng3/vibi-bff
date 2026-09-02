@@ -1,15 +1,44 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   adminFetch,
+  adminPost,
   AdminAuthError,
+  AdminCreditEvent,
+  AdminGrantCreditsResponse,
   AdminUserAccount,
+  AdminUserCreditsResponse,
   AdminUserJobsResponse,
 } from "../lib/api";
 import { formatDurationMs, formatIsoDateTime } from "../lib/format";
 import { providerBadgeClass, providerLabel } from "../lib/providers";
+import DataTable from "../components/DataTable";
 
 const PAGE_SIZE = 50;
+const CREDITS_PAGE_SIZE = 50;
+// BFF AdminRoutes.MAX_ADMIN_GRANT_PER_CALL 과 동일 — 오조작(0 하나 더) 방어.
+const MAX_GRANT_PER_CALL = 500;
+
+// 크레딧 이벤트 type → 표시 라벨/배지. BFF AdminCreditEvent.type 과 1:1.
+const CREDIT_EVENT_LABEL: Record<string, string> = {
+  signup: "가입 보너스",
+  purchase: "인앱 구매",
+  ad_reward: "광고 시청",
+  admin_grant: "관리자 지급",
+  separation: "음원 분리",
+  refund: "실패 환불",
+  merge_carry: "계정 병합 이월",
+};
+
+const CREDIT_EVENT_BADGE: Record<string, string> = {
+  signup: "bg-sky-100 text-sky-800",
+  purchase: "bg-emerald-100 text-emerald-800",
+  ad_reward: "bg-amber-100 text-amber-800",
+  admin_grant: "bg-violet-100 text-violet-800",
+  separation: "bg-neutral-100 text-neutral-700",
+  refund: "bg-blue-100 text-blue-800",
+  merge_carry: "bg-teal-100 text-teal-800",
+};
 
 export default function UserDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -74,37 +103,34 @@ export default function UserDetailPage() {
 
       {account && <AccountSection account={account} />}
 
+      <CreditsSection userId={id} />
+
       {data.jobs.length === 0 ? (
         <p className="rounded-lg border border-dashed border-neutral-300 p-8 text-center text-sm text-neutral-500">
           이 사용자의 render 잡이 아직 없습니다.
         </p>
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
-          <table className="min-w-full divide-y divide-neutral-200 text-sm">
-            <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
-              <tr>
-                <th className="px-4 py-3">Job ID</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3 text-right">Duration</th>
-                <th className="px-4 py-3 text-right">Separations</th>
-                <th className="px-4 py-3">Created</th>
-                <th className="px-4 py-3">Finished</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-100">
-              {data.jobs.map((j) => (
-                <tr key={j.jobId} className="hover:bg-neutral-50">
-                  <td className="px-4 py-3 font-mono text-xs text-neutral-700">{j.jobId}</td>
-                  <td className="px-4 py-3"><StatusBadge status={j.status} /></td>
-                  <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(j.sourceDurationMs)}</td>
-                  <td className="px-4 py-3 text-right tabular-nums">{j.separationCount}</td>
-                  <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(j.createdAt)}</td>
-                  <td className="px-4 py-3 text-neutral-600">{j.finishedAt ? formatIsoDateTime(j.finishedAt) : "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          columns={[
+            { label: "Job ID" },
+            { label: "Status" },
+            { label: "Duration", align: "right" },
+            { label: "Separations", align: "right" },
+            { label: "Created" },
+            { label: "Finished" },
+          ]}
+        >
+          {data.jobs.map((j) => (
+            <tr key={j.jobId} className="hover:bg-neutral-50">
+              <td className="px-4 py-3 font-mono text-xs text-neutral-700">{j.jobId}</td>
+              <td className="px-4 py-3"><StatusBadge status={j.status} /></td>
+              <td className="px-4 py-3 text-right tabular-nums">{formatDurationMs(j.sourceDurationMs)}</td>
+              <td className="px-4 py-3 text-right tabular-nums">{j.separationCount}</td>
+              <td className="px-4 py-3 text-neutral-600">{formatIsoDateTime(j.createdAt)}</td>
+              <td className="px-4 py-3 text-neutral-600">{j.finishedAt ? formatIsoDateTime(j.finishedAt) : "-"}</td>
+            </tr>
+          ))}
+        </DataTable>
       )}
 
       {totalPages > 1 && (
@@ -124,67 +150,287 @@ export default function UserDetailPage() {
   );
 }
 
-// 계정 연결 상태 + 병합 이력. 통합(병합) 안 한 계정은 연결 수단 1개 + 병합 이력 0건.
-function AccountSection({ account }: { account: AdminUserAccount }) {
-  const { identities, merges } = account;
+// 크레딧 변동 타임라인 — 지급(가입 보너스/구매/광고/관리자)·차감(분리)·환불·병합 이월을
+// 한 스트림으로. 최신순이며 "더 보기" 로 이어붙인다 (잡 목록의 페이지 이동과 달리 누적 열람이
+// 자연스러운 이력 화면이라).
+function CreditsSection({ userId }: { userId: string }) {
+  const navigate = useNavigate();
+  const [summary, setSummary] = useState<AdminUserCreditsResponse | null>(null);
+  const [events, setEvents] = useState<AdminCreditEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  // cancelled: userId 가 바뀌면 이전 사용자의 늦은 응답이 새 사용자 화면을 덮어쓰지 않게 버린다
+  // (같은 페이지의 잡·계정 로드와 동일한 규약).
+  const load = async (offset: number, cancelled?: () => boolean) => {
+    setLoading(true);
+    try {
+      const res = await adminFetch<AdminUserCreditsResponse>(
+        `/api/v2/admin/users/${userId}/credits?limit=${CREDITS_PAGE_SIZE}&offset=${offset}`,
+      );
+      if (cancelled?.()) return;
+      setSummary(res);
+      // offset 페이징 도중 새 이벤트가 생기면 경계가 밀려 같은 행이 다시 올 수 있다 — 서버가 주는
+      // 전역 유니크 id 로 중복을 걸러낸다.
+      setEvents((prev) => {
+        if (offset === 0) return res.events;
+        const seen = new Set(prev.map((e) => e.id));
+        return [...prev, ...res.events.filter((e) => !seen.has(e.id))];
+      });
+    } catch (e) {
+      if (cancelled?.()) return;
+      // 인증 만료는 다른 섹션과 같이 로그인으로 — 그 외는 이 섹션만 실패 표시 (best-effort).
+      if (e instanceof AdminAuthError) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      setFailed(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setEvents([]);
+    setSummary(null);
+    setFailed(false);
+    void load(0, () => cancelled);
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  if (failed) {
+    return (
+      <section className="rounded-lg border border-neutral-200 bg-white p-4">
+        <h2 className="text-sm font-semibold text-neutral-800">크레딧</h2>
+        <p className="mt-2 text-sm text-neutral-500">크레딧 이력을 불러오지 못했습니다.</p>
+      </section>
+    );
+  }
+  if (!summary) {
+    return (
+      <section className="rounded-lg border border-neutral-200 bg-white p-4">
+        <h2 className="text-sm font-semibold text-neutral-800">크레딧</h2>
+        <p className="mt-2 text-sm text-neutral-500">불러오는 중…</p>
+      </section>
+    );
+  }
+
   return (
-    <section className="space-y-4 rounded-lg border border-neutral-200 bg-white p-4">
-      <div className="space-y-2">
-        <h2 className="text-sm font-semibold text-neutral-800">연결된 로그인 계정</h2>
-        {identities.length === 0 ? (
-          <p className="text-sm text-neutral-500">연결된 로그인 수단 정보가 없습니다.</p>
-        ) : (
-          <ul className="flex flex-wrap gap-2">
-            {identities.map((idn) => (
-              <li
-                key={`${idn.provider}:${idn.email}`}
-                className="flex items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-sm"
-              >
-                <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(idn.provider)}`}>
-                  {providerLabel(idn.provider)}
-                </span>
-                <span className="text-neutral-700">{idn.email}</span>
-                <span className="text-xs text-neutral-400">{idn.primary ? "primary" : "linked"}</span>
-              </li>
-            ))}
-          </ul>
-        )}
+    <section className="space-y-3 rounded-lg border border-neutral-200 bg-white p-4">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <h2 className="text-sm font-semibold text-neutral-800">크레딧</h2>
+        <span className="text-lg font-semibold tabular-nums text-neutral-900">{summary.balance}</span>
+        <span className="text-xs text-neutral-500">현재 잔액 · 이력 {summary.total}건</span>
       </div>
 
-      {merges.length > 0 && (
-        <div className="space-y-2">
-          <h2 className="text-sm font-semibold text-neutral-800">병합 이력</h2>
-          <p className="text-xs text-neutral-500">이 계정으로 흡수된 다른 계정 + 이월된 크레딧.</p>
-          <div className="overflow-x-auto rounded border border-neutral-200">
-            <table className="min-w-full divide-y divide-neutral-200 text-sm">
-              <thead className="bg-neutral-50 text-left text-xs font-medium uppercase tracking-wide text-neutral-500">
-                <tr>
-                  <th className="px-4 py-2">흡수된 계정</th>
-                  <th className="px-4 py-2 text-right">이월 크레딧</th>
-                  <th className="px-4 py-2">병합 시각</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-neutral-100">
-                {merges.map((m, i) => (
-                  <tr key={`${m.fromProvider}:${m.fromEmail}:${i}`} className="hover:bg-neutral-50">
-                    <td className="px-4 py-2">
-                      <span className="flex items-center gap-2">
-                        <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(m.fromProvider)}`}>
-                          {providerLabel(m.fromProvider)}
-                        </span>
-                        <span className="text-neutral-700">{m.fromEmail}</span>
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums">
-                      {m.carriedCredits > 0 ? `+${m.carriedCredits}` : "0"}
-                    </td>
-                    <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(m.mergedAt)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+      <GrantCreditsForm userId={userId} onGranted={() => void load(0)} />
+
+      {summary.hasMerges && (
+        <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          계정 병합 이력이 있는 사용자입니다. 흡수된 계정의 결제 이력이 감사 보존을 위해 이 계정으로
+          옮겨져 있어 <strong>변동 합계가 현재 잔액과 다를 수 있습니다</strong>. 잔액은 위 숫자가 정확합니다.
+        </p>
+      )}
+
+      {events.length === 0 ? (
+        <p className="text-sm text-neutral-500">크레딧 변동 이력이 없습니다.</p>
+      ) : (
+        <DataTable
+          dense
+          wrapperClassName="rounded border border-neutral-200"
+          columns={[
+            { label: "시각" },
+            { label: "유형" },
+            { label: "변동", align: "right" },
+            { label: "상세" },
+          ]}
+        >
+          {events.map((e) => (
+            <tr key={e.id} className="hover:bg-neutral-50">
+              <td className="px-4 py-2 text-neutral-600">{formatIsoDateTime(e.at)}</td>
+              <td className="px-4 py-2">
+                <span
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${
+                    CREDIT_EVENT_BADGE[e.type] ?? "bg-neutral-100 text-neutral-700"
+                  }`}
+                >
+                  {CREDIT_EVENT_LABEL[e.type] ?? e.type}
+                </span>
+              </td>
+              <td
+                className={`px-4 py-2 text-right tabular-nums font-medium ${
+                  e.delta < 0 ? "text-rose-600" : e.delta > 0 ? "text-emerald-700" : "text-neutral-500"
+                }`}
+              >
+                {e.delta > 0 ? `+${e.delta}` : e.delta}
+              </td>
+              <td className="px-4 py-2 text-neutral-600">
+                <CreditEventDetail event={e} />
+              </td>
+            </tr>
+          ))}
+        </DataTable>
+      )}
+
+      {events.length < summary.total && (
+        <button
+          onClick={() => void load(events.length)}
+          disabled={loading}
+          className="rounded border border-neutral-300 px-3 py-1.5 text-sm hover:bg-neutral-100 disabled:opacity-50"
+        >
+          {loading ? "불러오는 중…" : `더 보기 (${summary.total - events.length}건 남음)`}
+        </button>
+      )}
+    </section>
+  );
+}
+
+// 분리/환불은 "몇 분짜리 잡이었나" 가 핵심이라 길이 + 잡 ID, 나머지는 서버가 준 detail
+// (구매 product id / 병합된 계정) 을 그대로 보여준다.
+function CreditEventDetail({ event }: { event: AdminCreditEvent }) {
+  if (event.type === "separation" || event.type === "refund") {
+    return (
+      <span className="flex flex-wrap items-baseline gap-2">
+        <span>{event.sourceDurationMs ? formatDurationMs(event.sourceDurationMs) : "길이 미상"}</span>
+        {event.jobId && <span className="font-mono text-xs text-neutral-400">{event.jobId}</span>}
+      </span>
+    );
+  }
+  // 관리자 지급은 "왜" 와 "누가" 가 감사의 핵심 — 사유 + 지급자를 함께 보여준다.
+  if (event.type === "admin_grant") {
+    return (
+      <span className="flex flex-wrap items-baseline gap-2">
+        <span>{event.detail ?? "사유 없음"}</span>
+        {event.actor && <span className="text-xs text-neutral-400">by {event.actor}</span>}
+      </span>
+    );
+  }
+  return <span>{event.detail ?? "-"}</span>;
+}
+
+// BFF 가 던지는 error 코드 → 운영자용 한국어 문구. 미매핑 코드는 그대로 노출한다
+// (관리자 화면이라 raw 코드가 보여도 무해하고, 원인 파악에 오히려 도움).
+const GRANT_ERROR_MESSAGE: Record<string, string> = {
+  invalid_credits: `수량은 1~${MAX_GRANT_PER_CALL} 사이여야 합니다.`,
+  reason_required: "지급 사유를 입력해 주세요.",
+  reason_too_long: "사유는 200자 이내로 입력해 주세요.",
+  admin_grant_daily_cap_exceeded: "24시간 지급 한도를 초과했습니다. 내일 다시 시도해 주세요.",
+  "user not found": "사용자를 찾을 수 없습니다.",
+};
+
+// 운영자 수동 크레딧 지급. 사유는 필수 — 서버도 거부하지만 여기서 먼저 막아 왕복을 아낀다.
+// 성공하면 상위 타임라인을 처음부터 다시 읽어 방금 지급분이 바로 보이게 한다.
+function GrantCreditsForm({ userId, onGranted }: { userId: string; onGranted: () => void }) {
+  const navigate = useNavigate();
+  const [credits, setCredits] = useState("");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [granted, setGranted] = useState<number | null>(null);
+  // 지급은 멱등이 아니다 (호출 1회 = 지급 1회). state 는 리렌더 후에야 갱신돼 같은 렌더에서
+  // 두 번 발생한 Enter/클릭을 막지 못하므로, 실제 가드는 ref 로 건다.
+  const inFlight = useRef(false);
+
+  const amount = Number.parseInt(credits, 10);
+  const valid = Number.isInteger(amount) && amount >= 1 && amount <= MAX_GRANT_PER_CALL && reason.trim().length > 0;
+
+  const submit = async () => {
+    if (!valid || inFlight.current) return;
+    inFlight.current = true;
+    setSubmitting(true);
+    setError(null);
+    setGranted(null);
+    try {
+      const res = await adminPost<AdminGrantCreditsResponse>(
+        `/api/v2/admin/users/${userId}/credits`,
+        { credits: amount, reason: reason.trim() },
+      );
+      setCredits("");
+      setReason("");
+      setGranted(res.granted);
+      onGranted();
+    } catch (e) {
+      if (e instanceof AdminAuthError) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      const code = e instanceof Error ? e.message : "";
+      setError(GRANT_ERROR_MESSAGE[code] ?? `지급 실패 (${code || "unknown"})`);
+    } finally {
+      inFlight.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="rounded border border-neutral-200 bg-neutral-50 p-3">
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1 text-xs text-neutral-600">
+          수량
+          <input
+            type="number"
+            min={1}
+            max={MAX_GRANT_PER_CALL}
+            value={credits}
+            onChange={(e) => setCredits(e.target.value)}
+            className="w-24 rounded border border-neutral-300 px-2 py-1.5 text-sm tabular-nums"
+            placeholder="10"
+          />
+        </label>
+        <label className="flex min-w-[16rem] flex-1 flex-col gap-1 text-xs text-neutral-600">
+          지급 사유 (필수)
+          <input
+            type="text"
+            value={reason}
+            maxLength={200}
+            onChange={(e) => setReason(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void submit(); }}
+            className="rounded border border-neutral-300 px-2 py-1.5 text-sm"
+            placeholder="예: 분리 실패 보상"
+          />
+        </label>
+        <button
+          onClick={() => void submit()}
+          disabled={!valid || submitting}
+          className="rounded bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-40"
+        >
+          {submitting ? "지급 중…" : "크레딧 지급"}
+        </button>
+      </div>
+      {error && <p className="mt-2 text-xs text-rose-600">{error}</p>}
+      {granted !== null && !error && (
+        <p className="mt-2 text-xs text-emerald-700">{granted} 크레딧을 지급했습니다.</p>
+      )}
+    </div>
+  );
+}
+
+// 계정에 연결된 로그인 수단. 병합 이력(흡수된 계정·이월 크레딧)은 크레딧 타임라인의
+// "계정 병합 이월" 이벤트가 정본이라 여기서 중복 표시하지 않는다.
+function AccountSection({ account }: { account: AdminUserAccount }) {
+  const { identities } = account;
+  return (
+    <section className="space-y-2 rounded-lg border border-neutral-200 bg-white p-4">
+      <h2 className="text-sm font-semibold text-neutral-800">연결된 로그인 계정</h2>
+      {identities.length === 0 ? (
+        <p className="text-sm text-neutral-500">연결된 로그인 수단 정보가 없습니다.</p>
+      ) : (
+        <ul className="flex flex-wrap gap-2">
+          {identities.map((idn) => (
+            <li
+              key={`${idn.provider}:${idn.email}`}
+              className="flex items-center gap-2 rounded border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-sm"
+            >
+              <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${providerBadgeClass(idn.provider)}`}>
+                {providerLabel(idn.provider)}
+              </span>
+              <span className="text-neutral-700">{idn.email}</span>
+              <span className="text-xs text-neutral-400">{idn.primary ? "primary" : "linked"}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   );

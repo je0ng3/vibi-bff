@@ -3,8 +3,10 @@ package com.vibi.bff
 import com.vibi.bff.config.DbConfig
 import com.vibi.bff.db.DbBootstrap
 import com.vibi.bff.model.AuthProvider
+import com.vibi.bff.service.AdminGrantResult
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.CreditRepository
+import com.vibi.bff.service.SIGNUP_BONUS_CREDITS
 import com.vibi.bff.service.UserRepository
 import com.zaxxer.hikari.HikariDataSource
 import java.time.Instant
@@ -13,6 +15,8 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -92,6 +96,15 @@ class AdminRepositoryTest {
      * 여전히 admin 을 거부한다(V9 주석). CHECK_CLAUSE 에 'apple' 이 들어간 제약을 모두 드롭 —
      * credits>0 제약은 'apple' 을 포함 안 해 보존된다.
      */
+    /** 상한을 매번 넘기지 않도록 한 겹 — 대부분의 테스트는 상한이 관심사가 아니다. */
+    private fun grant(
+        targetUserId: UUID,
+        actorUserId: UUID,
+        credits: Int,
+        reason: String,
+        dailyCap: Int = 1000,
+    ) = admin.grantCredits(targetUserId, actorUserId, credits, reason, dailyCap)
+
     private fun allowAdminPlatformInH2() = transaction {
         val names = mutableListOf<String>()
         exec(
@@ -260,10 +273,10 @@ class AdminRepositoryTest {
         )
     }
 
-    // ── getUserAccount (연결/병합) ───────────────────────────────────────────
+    // ── getUserAccount (연결된 로그인 수단) ──────────────────────────────────
 
     @Test
-    fun `user account lists identities and is empty of merges for a solo account`() {
+    fun `user account lists the single identity of a solo account`() {
         val solo = users.upsert(AuthProvider.GOOGLE, "g-solo", "solo@example.com", "Solo", null)
 
         val account = admin.getUserAccount(solo.id)
@@ -271,7 +284,6 @@ class AdminRepositoryTest {
         assertEquals("google", account.identities.single().provider)
         assertEquals("solo@example.com", account.identities.single().email)
         assertEquals(true, account.identities.single().primary)
-        assertEquals(emptyList(), account.merges)
     }
 
     @Test
@@ -300,25 +312,17 @@ class AdminRepositoryTest {
     }
 
     @Test
-    fun `user account surfaces merge history with absorbed account and carried credits`() {
-        // A (google): 무료 보너스만. B (apple): 무료 보너스 + 획득 5 → 병합 시 5 이월.
+    fun `user account lists both identities after a merge`() {
+        // 병합 이력 자체(흡수된 계정·이월 크레딧)는 크레딧 타임라인의 merge_carry 가 정본 —
+        // 여기서는 흡수 후 identity 가 둘 다 붙는지만 본다.
         val a = users.upsert(AuthProvider.GOOGLE, "g-a", "a@example.com", "Alice", null)
-        credits.grantSignupBonus(a.id)
         val b = users.upsert(AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
         credits.grantSignupBonus(b.id)
-        credits.grantPurchase(b.id, "google", "earn-1", "rewarded", 5)
 
         users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-b", "b@icloud.com", "Bob", null)
 
         val account = admin.getUserAccount(a.id)
-        // 병합 후 A 는 google(primary) + apple(secondary) 두 identity.
         assertEquals(setOf("google", "apple"), account.identities.map { it.provider }.toSet())
-        // 병합 이력 1건 — 흡수된 apple 계정 + 이월 크레딧 5.
-        assertEquals(1, account.merges.size)
-        val merge = account.merges.single()
-        assertEquals("apple", merge.fromProvider)
-        assertEquals("b@icloud.com", merge.fromEmail)
-        assertEquals(5, merge.carriedCredits)
     }
 
     @Test
@@ -453,5 +457,215 @@ class AdminRepositoryTest {
         assertEquals(0, stats.totalDeletions)
         assertEquals(0.0, stats.avgTenureDays)
         assertEquals(0.0, stats.medianTenureDays)
+    }
+
+    // ── getUserCredits (크레딧 변동 타임라인) ─────────────────────────────────
+
+    /** [insertSeparationJob] 과 달리 생성한 잡 ID 를 돌려준다 — reserve/refund 의 ref_id 조립용. */
+    private fun insertSeparationJobReturningId(userId: UUID, durationMs: Long): String {
+        val id = "sep-" + UUID.randomUUID()
+        transaction {
+            exec(
+                "INSERT INTO separation_jobs (id, user_id, source_duration_ms, status, client) " +
+                    "VALUES ('$id', CAST('$userId' AS UUID), $durationMs, 'READY', 'mobile')",
+            )
+        }
+        return id
+    }
+
+    @Test
+    fun `getUserCredits merges grants consumption and refunds into one timeline`() {
+        allowAdminPlatformInH2()
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        credits.grantSignupBonus(u.id)
+        credits.grantPurchase(u.id, "google", "tx-1", "vibi.credits.10", 10)
+        // 광고/관리자 지급은 platform 만 다른 같은 테이블 — 잔액엔 영향 없이 이벤트 종류만 확인.
+        insertTxn(u.id, "admob", "ssv-1", 1, Instant.now())
+        insertTxn(u.id, "admin", "grant-1", 7, Instant.now())
+        val jobId = insertSeparationJobReturningId(u.id, 252_000)
+        credits.reserve(u.id, jobId, 5)
+
+        val res = admin.getUserCredits(u.id, 50, 0)
+
+        assertEquals(5, res.events.size)
+        assertEquals(5L, res.total)
+        assertEquals(SIGNUP_BONUS_CREDITS + 10 - 5, res.balance)
+        assertTrue(!res.hasMerges)
+
+        val byType = res.events.associateBy { it.type }
+        assertEquals(SIGNUP_BONUS_CREDITS, byType.getValue("signup").delta)
+        assertEquals(10, byType.getValue("purchase").delta)
+        assertEquals(1, byType.getValue("ad_reward").delta)
+        assertEquals(7, byType.getValue("admin_grant").delta)
+
+        // 분리 차감만 음수 + 잡 ID/입력 길이가 붙어 "몇 분짜리로 몇 개 차감" 을 표시할 수 있다.
+        val consumed = byType.getValue("separation")
+        assertEquals(-5, consumed.delta)
+        assertEquals(jobId, consumed.jobId)
+        assertEquals(252_000L, consumed.sourceDurationMs)
+        // 결제 이벤트엔 product_id 가, 차감엔 detail 이 없다.
+        assertEquals("vibi.credits.10", byType.getValue("purchase").detail)
+        assertNull(consumed.detail)
+
+        // 잡 실패 환불도 같은 잡을 가리키는 별도 이벤트로 뜬다.
+        credits.refund(jobId)
+        val refunded = admin.getUserCredits(u.id, 50, 0).events.single { it.type == "refund" }
+        assertEquals(5, refunded.delta)
+        assertEquals(jobId, refunded.jobId)
+        assertEquals(252_000L, refunded.sourceDurationMs)
+    }
+
+    @Test
+    fun `getUserCredits keeps the event when the referenced separation job is gone`() {
+        // 잡 row 가 사라져도(오래된 잡 정리 등) 차감 이벤트 자체는 남아야 한다 — 잡 ID 는 ledger 의
+        // ref_id 에서 나오므로 그대로 뜨고, 길이만 null.
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        credits.grantSignupBonus(u.id)
+        credits.reserve(u.id, "sep-ghost", 1)
+
+        val event = admin.getUserCredits(u.id, 50, 0).events.single { it.type == "separation" }
+        assertEquals("sep-ghost", event.jobId)
+        assertNull(event.sourceDurationMs)
+    }
+
+    @Test
+    fun `getUserCredits paginates newest first and reports the full total`() {
+        val u = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "A", null)
+        val now = Instant.now()
+        // 시각을 명시 제어해 정렬을 결정적으로 — 같은 밀리초에 몰리면 순서 단정이 불안정하다.
+        insertTxn(u.id, "google", "tx-old", 1, now.minusSeconds(300))
+        insertTxn(u.id, "google", "tx-mid", 2, now.minusSeconds(200))
+        insertTxn(u.id, "google", "tx-new", 3, now.minusSeconds(100))
+
+        val first = admin.getUserCredits(u.id, 2, 0)
+        assertEquals(3L, first.total)
+        assertEquals(listOf(3, 2), first.events.map { it.delta })
+        // 페이지 경계가 안정적이려면 이벤트 키가 소스를 가로질러 유니크해야 한다.
+        assertEquals(2, first.events.map { it.id }.toSet().size)
+
+        val second = admin.getUserCredits(u.id, 2, 2)
+        assertEquals(3L, second.total)
+        assertEquals(listOf(1), second.events.map { it.delta })
+        assertTrue(first.events.none { f -> second.events.any { it.id == f.id } }) // 페이지 간 중복 없음
+    }
+
+    @Test
+    fun `getUserCredits surfaces merge carry and flags that the sum may not match the balance`() {
+        val a = users.upsert(AuthProvider.GOOGLE, "g-1", "a@example.com", "Alice", null)
+        credits.grantSignupBonus(a.id)
+        val b = users.upsert(AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+        credits.grantSignupBonus(b.id)
+        credits.grantPurchase(b.id, "google", "earn-1", "vibi.credits.5", 5)
+        users.linkOrMerge(a.id, AuthProvider.APPLE, "ap-1", "a@icloud.com", "Alice", null)
+
+        val res = admin.getUserCredits(a.id, 50, 0)
+
+        assertTrue(res.hasMerges)
+        val carry = res.events.single { it.type == "merge_carry" }
+        assertEquals(5, carry.delta) // 무료 보너스 제외, 획득분만 이월
+        assertEquals("apple:a@icloud.com", carry.detail)
+
+        // B 의 결제 row 가 감사 보존을 위해 A 로 re-point 되므로 타임라인엔 구매(+5)와 이월(+5)이
+        // 둘 다 보이지만 실제 잔액 증가는 carry 5 뿐 — hasMerges 가 이 괴리를 UI 에 알린다.
+        assertEquals(SIGNUP_BONUS_CREDITS + 5, res.balance)
+        assertTrue(res.events.sumOf { it.delta } > res.balance)
+    }
+
+    // ── grantCredits / 감사 로그 ─────────────────────────────────────────────
+
+    @Test
+    fun `grantCredits raises the balance and records who granted why`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val target = users.upsert(AuthProvider.GOOGLE, "g-user", "u@example.com", "User", null)
+        credits.grantSignupBonus(target.id)
+
+        val res = grant(target.id, actor.id, 7, "분리 실패 보상") as AdminGrantResult.Granted
+
+        assertEquals(7, res.granted)
+        assertEquals(SIGNUP_BONUS_CREDITS + 7, res.balance)
+        assertEquals(SIGNUP_BONUS_CREDITS + 7, credits.balance(target.id))
+        assertTrue(res.transactionId.startsWith("admin-"))
+
+        // 타임라인에 사유·지급자가 붙어 나온다 (감사 로그 join).
+        val event = admin.getUserCredits(target.id, 50, 0).events.single { it.type == "admin_grant" }
+        assertEquals(7, event.delta)
+        assertEquals("분리 실패 보상", event.detail)
+        assertEquals("ops@example.com", event.actor)
+
+        // 감사 로그 페이지에도 같은 1건.
+        val audit = admin.listAudit(50, 0).entries.single()
+        assertEquals("credit_grant", audit.action)
+        assertEquals("ops@example.com", audit.actorEmail)
+        assertEquals(target.id.toString(), audit.targetUserId)
+        assertEquals("u@example.com", audit.targetEmail)
+        assertEquals(7, audit.amount)
+        assertEquals("분리 실패 보상", audit.detail)
+    }
+
+    @Test
+    fun `grantCredits reports an unknown target and writes nothing`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+
+        assertEquals(AdminGrantResult.TargetNotFound, grant(UUID.randomUUID(), actor.id, 5, "오타"))
+
+        // 지급이 없었으니 감사 row 도 없어야 한다 (한 트랜잭션 안에서 존재 확인 → insert).
+        assertEquals(0, admin.listAudit(50, 0).entries.size)
+    }
+
+    @Test
+    fun `grantCredits refuses to exceed the granting admin's daily cap`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val t1 = users.upsert(AuthProvider.GOOGLE, "g-u1", "u1@example.com", "U1", null)
+        val t2 = users.upsert(AuthProvider.GOOGLE, "g-u2", "u2@example.com", "U2", null)
+
+        assertTrue(grant(t1.id, actor.id, 8, "1차", dailyCap = 10) is AdminGrantResult.Granted)
+        // 상한은 지급자 기준 합산 — 다른 계정으로 나눠 지급해도 우회되지 않는다.
+        val denied = grant(t2.id, actor.id, 5, "2차", dailyCap = 10)
+        assertEquals(AdminGrantResult.CapExceeded(grantedRecently = 8, cap = 10), denied)
+        assertEquals(0, credits.balance(t2.id))
+        assertEquals(1, admin.listAudit(50, 0).total) // 거부된 시도는 기록하지 않는다
+    }
+
+    @Test
+    fun `grantedByActorSince sums only that admin's grants inside the window`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val other = users.upsert(AuthProvider.GOOGLE, "g-admin2", "ops2@example.com", "Ops2", null)
+        val t1 = users.upsert(AuthProvider.GOOGLE, "g-u1", "u1@example.com", "U1", null)
+        val t2 = users.upsert(AuthProvider.GOOGLE, "g-u2", "u2@example.com", "U2", null)
+
+        // 같은 운영자가 서로 다른 계정에 나눠 지급해도 합산된다 (계정 분산 우회 차단).
+        grant(t1.id, actor.id, 4, "보상")
+        grant(t2.id, actor.id, 6, "보상")
+        grant(t1.id, other.id, 100, "다른 운영자")
+
+        val since = Instant.now().minusSeconds(3600)
+        assertEquals(10, admin.grantedByActorSince(actor.id, since))
+        assertEquals(100, admin.grantedByActorSince(other.id, since))
+        // 창 밖(미래 기준 since)은 0.
+        assertEquals(0, admin.grantedByActorSince(actor.id, Instant.now().plusSeconds(60)))
+    }
+
+    @Test
+    fun `listAudit returns newest first across action types`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val target = users.upsert(AuthProvider.GOOGLE, "g-user", "u@example.com", "User", null)
+
+        grant(target.id, actor.id, 3, "테스트 충전")
+        admin.setUserRoleAudited(target.id, actor.id, "admin")
+        // 대상이 사용자 row 가 아닌 액션 — target 은 비고 detail 에 해시만 남는다.
+        admin.recordAudit(actor.id, "unblock_rejoin", detail = "a".repeat(64))
+
+        val res = admin.listAudit(50, 0)
+        assertEquals(3, res.total)
+        assertEquals(listOf("unblock_rejoin", "set_role", "credit_grant"), res.entries.map { it.action })
+        val unblock = res.entries.first()
+        assertNull(unblock.targetUserId)
+        assertNull(unblock.targetEmail)
+        assertNull(unblock.amount)
     }
 }

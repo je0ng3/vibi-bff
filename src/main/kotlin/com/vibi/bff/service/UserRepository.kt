@@ -433,6 +433,8 @@ class UserRepository {
      *   • user_credits — `ON DELETE CASCADE` → 함께 삭제
      *   • user_identities — `ON DELETE CASCADE` (V16) → 링크된 secondary identity 도 함께 삭제
      *   • render_jobs / separation_jobs / credit_transactions — `ON DELETE SET NULL` → 익명 row 로 보존
+     *   • admin_audit_log — `ON DELETE SET NULL`. **단 운영자였던 계정의 `actor_email` 은 남는다**
+     *     (V19 주석 참조 — 행위자를 지우면 감사 로그가 무의미해지므로 둔 의도적 예외).
      *
      * 같은 (provider, providerSub) 로 재가입 시점에는 [upsert] 가 새 UUID 의 row 를 생성하므로
      * 이전 잡 분석 row 는 새 사용자와 다른 UUID — 익명 row 로 영구 격리된다.

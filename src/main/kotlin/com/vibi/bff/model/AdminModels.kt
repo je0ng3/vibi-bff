@@ -70,32 +70,64 @@ data class AdminUserJobsResponse(
 )
 
 /**
- * 사용자 상세 페이지에 표시할 계정 연결/병합 정보.
+ * 사용자 상세 페이지에 표시할 계정 연결 정보.
  *
- * - [identities] — 이 계정에 연결된 로그인 수단 전체 (primary=최초 가입 provider + 링크된 secondary).
- *   통합 안 한 계정은 1개. 사용자 대면 GET /auth/identities 와 동일한 [LinkedIdentity] 를 재사용해
- *   (provider/email/primary) 조립 로직·DTO 가 한 곳([UserRepository.listIdentities])에만 있도록 한다.
- * - [merges] — 이 계정으로 흡수된 다른 계정의 병합 이력 (account_merges). 병합이 없었으면 빈 리스트.
+ * [identities] — 이 계정에 연결된 로그인 수단 전체 (primary=최초 가입 provider + 링크된 secondary).
+ * 통합 안 한 계정은 1개. 사용자 대면 GET /auth/identities 와 동일한 [LinkedIdentity] 를 재사용해
+ * (provider/email/primary) 조립 로직·DTO 가 한 곳([UserRepository.listIdentities])에만 있도록 한다.
+ *
+ * 병합 이력은 [AdminUserCreditsResponse] 타임라인의 'merge_carry' 이벤트가 정본 — 같은
+ * account_merges row 를 두 화면이 각각 렌더하지 않도록 여기서는 노출하지 않는다.
  */
 @Serializable
 data class AdminUserAccount(
     val identities: List<LinkedIdentity>,
-    val merges: List<AdminAccountMerge>,
 )
 
 /**
- * 이 계정으로 흡수된 병합 이벤트 한 건 (account_merges 1 row).
+ * 사용자 상세 페이지의 크레딧 변동 타임라인 한 건. 세 소스(credit_transactions / credit_ledger /
+ * account_merges)를 하나의 이벤트 스트림으로 합친 것 — 저장 형태가 아니라 표시용 view 다.
  *
- * - [fromProvider] / [fromEmail] — 흡수돼 사라진 계정의 provider + 이메일.
- * - [carriedCredits] — 이 병합으로 이월된 크레딧 (무료 가입 보너스 제외분. 0 일 수 있음).
- * - [mergedAt] — 병합 시각 (ISO-8601 instant).
+ * - [id] — "<소스>:<PK>" 형태의 전역 유니크 키 (tx:12 / ledger:34 / merge:5). 정렬 tiebreaker 이자
+ *   클라이언트의 목록 key·중복 제거 키.
+ * - [type] — 'signup'(가입 보너스) / 'purchase'(인앱결제) / 'ad_reward'(보상형 광고) /
+ *   'admin_grant'(관리자 지급) / 'separation'(음원분리 차감) / 'refund'(분리 실패 환불) /
+ *   'merge_carry'(계정 병합 이월).
+ * - [delta] — 부호 포함 변동량. 차감(separation)만 음수, 나머지는 양수 (병합 이월은 0 일 수 있다).
+ * - [detail] — 타입별 보조 표시값. purchase/ad_reward 는 product_id, admin_grant 는 운영자가
+ *   입력한 사유(admin_audit_log), merge_carry 는 "provider:email" (흡수된 계정). 없으면 null.
+ * - [actor] — admin_grant 에서 지급한 운영자 이메일. 감사 row 가 없는 옛 지급분은 null.
+ * - [jobId] / [sourceDurationMs] — separation·refund 에서 해당 분리 잡과 입력 길이.
+ *   잡 row 가 이미 사라졌거나(탈퇴 익명화) 다른 타입이면 null.
  */
 @Serializable
-data class AdminAccountMerge(
-    val fromProvider: String,
-    val fromEmail: String,
-    val carriedCredits: Int,
-    val mergedAt: String,
+data class AdminCreditEvent(
+    val id: String,
+    val at: String,
+    val type: String,
+    val delta: Int,
+    val detail: String? = null,
+    val actor: String? = null,
+    val jobId: String? = null,
+    val sourceDurationMs: Long? = null,
+)
+
+/**
+ * 사용자 크레딧 타임라인 응답.
+ *
+ * [balance] 는 user_credits 의 실제 잔액이고, [events] 의 delta 합계와 **일치하지 않을 수 있다** —
+ * 계정 병합이 있었던 경우 흡수된 계정 B 의 결제 이력(credit_transactions)은 감사 보존을 위해 A 로
+ * re-point 되지만 A 의 잔액에 더해진 건 carry(min(B.잔액, B.획득분)) 뿐이고, B 의 소비 이력
+ * (credit_ledger)은 의도적으로 orphan 되기 때문이다 (UserRepository.mergeAccounts 참조).
+ * re-point 된 row 를 A 자신의 결제와 구분할 컬럼이 없어 소급 보정도 불가능하다. 따라서 UI 는
+ * 잔액을 [balance] 로만 표시하고, [hasMerges] 가 true 면 "합계와 잔액이 다를 수 있음" 을 알린다.
+ */
+@Serializable
+data class AdminUserCreditsResponse(
+    val balance: Int,
+    val events: List<AdminCreditEvent>,
+    val total: Long,
+    val hasMerges: Boolean,
 )
 
 /**
@@ -245,6 +277,54 @@ data class AdminDeletionDaily(
 @Serializable
 data class AdminSetRoleRequest(
     val role: String,
+)
+
+/**
+ * 운영자 수동 크레딧 지급 요청 (`POST /admin/users/{id}/credits`).
+ *
+ * - [credits] — 지급 수량. 1..[com.vibi.bff.routes.MAX_ADMIN_GRANT_PER_CALL] (라우트에서 검증).
+ * - [reason] — 지급 사유. **필수** — 감사 로그의 핵심 값이라 빈 문자열을 거부한다
+ *   (예: "결제 오류 보상", "심사용 계정 충전").
+ */
+@Serializable
+data class AdminGrantCreditsRequest(
+    val credits: Int,
+    val reason: String,
+)
+
+/** 지급 결과 — [granted] 만큼 올라간 뒤의 [balance]. */
+@Serializable
+data class AdminGrantCreditsResponse(
+    val granted: Int,
+    val balance: Int,
+)
+
+/**
+ * 감사 로그 1건 (`admin_audit_log`). 컬럼 의미가 [action] 별로 다르다:
+ *
+ * - `credit_grant`   — [targetEmail] 에게 [amount] 크레딧 지급, [detail] = 사유
+ * - `set_role`       — [targetEmail] 의 role 을 [detail] 로 변경
+ * - `unblock_rejoin` — 재가입 차단 해제. 대상이 탈퇴자라 [targetEmail] 은 null, [detail] = identity 해시
+ *
+ * [actorEmail] 은 지급 시점에 denormalize 된 값 — 운영자 계정이 나중에 삭제돼도 남는다.
+ * [targetEmail] 은 현재 users row 에서 조회하므로 대상이 탈퇴하면 null 이 된다.
+ */
+@Serializable
+data class AdminAuditEntry(
+    val id: Long,
+    val at: String,
+    val actorEmail: String,
+    val action: String,
+    val targetUserId: String? = null,
+    val targetEmail: String? = null,
+    val amount: Int? = null,
+    val detail: String? = null,
+)
+
+@Serializable
+data class AdminAuditResponse(
+    val entries: List<AdminAuditEntry>,
+    val total: Long,
 )
 
 /**

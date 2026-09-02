@@ -55,7 +55,9 @@ mobile-only; the panel spends the shared balance.
 
 **Operations.** Large render / stem downloads optionally redirect to a Cloudflare R2 presigned
 URL (R2 egress is free); leave `R2_BUCKET` blank for local `respondFile` streaming. An
-`admin`-role dashboard API (`/api/v2/admin/*`) serves read-only analytics. Launch hardening:
+`admin`-role dashboard API (`/api/v2/admin/*`) serves analytics plus a short list of mutating
+operator actions — manual credit grants, role changes, rejoin unblocks — each appended to an
+`admin_audit_log` row (who, to whom, how much, why). Launch hardening:
 per-route rate limiting, sanitized errors, SSRF allow-listing, log masking, TLS-enforced DB
 URLs, and optional Sentry.
 
@@ -80,7 +82,7 @@ Cheat-sheet — all paths under `/api/v2`; params + errors live in `/swagger`:
 | Render   | `POST render` · `render/inputs` · `render/v3` · `GET render/{id}/{status,download}` |
 | Credits  | `GET credits` · `credits/cost` · `POST credits/{purchase,admin-grant}` |
 | Assets   | `POST assets/upload-url` · `peaks` |
-| Admin    | `GET admin/*` (read-only dashboard, `admin` role) |
+| Admin    | `GET admin/*` (dashboard + `admin/audit`) · `POST admin/users/{id}/credits` (manual grant, reason required) — `admin` role |
 
 ## Configuration
 

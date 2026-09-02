@@ -11,6 +11,8 @@ import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.requireAdmin
 import com.vibi.bff.plugins.requireUser
 import com.vibi.bff.plugins.requireUserActiveIfPossible
+import com.vibi.bff.service.AdminGrantResult
+import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.CreditCost
 import com.vibi.bff.service.CreditRepository
 import com.vibi.bff.service.PersoQuotaCache
@@ -44,14 +46,15 @@ private val log = LoggerFactory.getLogger("com.vibi.bff.routes.CreditRoutes")
  *   ([AppleReceiptVerifier] / [GoogleReceiptVerifier]) 후 잔액 가산. **검증 실패 / verifier 미설정은
  *   모두 외부에 `receipt_invalid` 로만 노출** (sanitize 규약 — 환불 vs 잘못된 productId 같은
  *   세부 사유를 클라이언트에 흘리지 않음).
- * - `POST /credits/admin-grant` — admin role 만 호출 가능, 영수증 검증 없이 잔액 가산. 운영자
- *   테스트·시연용. `(platform="admin", transactionId=서버 UUID)` 로 영수증 경로와 같은
- *   idempotency UNIQUE 를 그대로 활용 — 중복 grant 는 없지만 동일 row 가 transactions
- *   감사 로그에 남음.
+ * - `POST /credits/admin-grant` — admin role 만 호출 가능, 영수증 검증 없이 **자기** 잔액 가산.
+ *   운영자 테스트·시연용. 실지급은 [AdminRepository.grantCredits] 위임 — admin 대시보드의 수동
+ *   지급과 24h 한도·감사 로그를 공유한다.
  */
 fun Route.creditRoutes(
     creditRepository: CreditRepository,
     userRepository: UserRepository,
+    /** `/admin-grant` 가 admin 대시보드와 같은 지급·감사·한도 경로를 공유하기 위한 의존성. */
+    adminRepository: AdminRepository,
     appleVerifier: AppleReceiptVerifier?,
     googleVerifier: GoogleReceiptVerifier?,
     adMobVerifier: AdMobSsvVerifier?,
@@ -165,54 +168,59 @@ fun Route.creditRoutes(
             )
         }
 
-        // 관리자 무료 충전 — receipt 검증 없이 잔액 가산. requireAdmin 가드.
-        // 동일 사용자가 같은 productId 를 반복 호출하면 매번 새 transactionId (서버 UUID) 라
-        // 매번 가산되는 동작이 의도 (운영자 테스트 시 부족하면 다시 누름).
+        // 관리자 무료 충전 (자가) — receipt 검증 없이 자기 잔액 가산. 운영자 테스트·시연용.
+        //
+        // 실제 지급은 admin 대시보드의 수동 지급과 **같은 경로**([AdminRepository.grantCredits])를
+        // 탄다: 같은 24h 한도(지급자 기준, admin_audit_log 집계) + 같은 감사 로그. 두 엔드포인트가
+        // 서로 다른 소스로 한도를 세면 한쪽으로 우회해 두 배를 발행할 수 있고, 이쪽 지급만 감사에
+        // 안 남으면 "누가 얼마를 넣었나" 추적이 반쪽이 된다.
+        //
+        // 금액은 [CreditCatalog] SKU 로 고정 (임의 금액은 대시보드 쪽 endpoint 담당).
         post("/admin-grant") {
             val principal = call.requireAdmin(jwtSecret)
             val req = call.receive<AdminGrantRequest>()
             val credits = CreditCatalog.creditsFor(req.productId)
                 ?: throw ApiErrorException(HttpStatusCode.BadRequest, "unknown_product")
 
-            // 일일 상한 — admin JWT 유출/탈취 시 무제한 자가 적립을 막는 방어심층. 호출자가
-            // 직전 24h 동안 admin 적립한 합 + 이번 요청이 cap 을 넘으면 거부. 운영 default 1000,
-            // ADMIN_GRANT_DAILY_CAP 로 조정. (per-call 은 CreditCatalog 최대치로 이미 bounded.)
-            val dailyCap = System.getenv("ADMIN_GRANT_DAILY_CAP")?.toIntOrNull() ?: 1000
-            val since = Instant.now().minus(24, ChronoUnit.HOURS)
-            val grantedRecently = withContext(Dispatchers.IO) {
-                creditRepository.adminGrantedCreditsSince(principal.userId, since)
-            }
-            if (grantedRecently + credits > dailyCap) {
-                log.warn("admin-grant daily cap exceeded user={} recent={} cap={}", principal.userId, grantedRecently, dailyCap)
-                throw ApiErrorException(
-                    HttpStatusCode.TooManyRequests,
-                    "admin_grant_daily_cap_exceeded",
-                    "granted=$grantedRecently cap=$dailyCap in 24h",
-                )
-            }
-
-            val txId = "admin-${UUID.randomUUID()}"
-            val outcome = withContext(Dispatchers.IO) {
-                creditRepository.grantPurchase(
-                    userId = principal.userId,
-                    platform = "admin",
-                    transactionId = txId,
-                    productId = req.productId,
+            val result = withContext(Dispatchers.IO) {
+                adminRepository.grantCredits(
+                    targetUserId = principal.userId,
+                    actorUserId = principal.userId,
                     credits = credits,
+                    reason = "self-grant: ${req.productId}",
+                    dailyCap = adminGrantDailyCap(),
                 )
             }
-            log.info(
-                "admin grant: user={} tx={} product={} +{}",
-                principal.userId, txId, req.productId, outcome.granted,
-            )
-            call.respond(
-                HttpStatusCode.OK,
-                CreditPurchaseResponse(
-                    granted = outcome.granted,
-                    balance = outcome.balance,
-                    transactionId = txId,
-                )
-            )
+            when (result) {
+                // 운영자 자신이 대상이라 여기 오면 JWT 는 유효한데 계정이 사라진 상태.
+                is AdminGrantResult.TargetNotFound ->
+                    throw ApiErrorException(HttpStatusCode.Unauthorized, "account_deleted")
+                is AdminGrantResult.CapExceeded -> {
+                    log.warn(
+                        "admin-grant daily cap exceeded user={} recent={} cap={}",
+                        principal.userId, result.grantedRecently, result.cap,
+                    )
+                    throw ApiErrorException(
+                        HttpStatusCode.TooManyRequests,
+                        "admin_grant_daily_cap_exceeded",
+                        "granted=${result.grantedRecently} cap=${result.cap} in 24h",
+                    )
+                }
+                is AdminGrantResult.Granted -> {
+                    log.info(
+                        "admin grant: user={} tx={} product={} +{}",
+                        principal.userId, result.transactionId, req.productId, result.granted,
+                    )
+                    call.respond(
+                        HttpStatusCode.OK,
+                        CreditPurchaseResponse(
+                            granted = result.granted,
+                            balance = result.balance,
+                            transactionId = result.transactionId,
+                        )
+                    )
+                }
+            }
         }
 
         // AdMob 보상형 광고 SSV 콜백 — Google 서버가 광고 시청 완료 시 호출 (무인증, 서명이 인증).

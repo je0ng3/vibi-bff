@@ -112,14 +112,6 @@ class CreditRepository {
     }
 
     /**
-     * [userId] 가 [since] 이후 platform='admin' 으로 적립받은 크레딧 합. admin-grant 의 일일
-     * 상한 enforcement 용 — admin JWT 가 유출/탈취되어도 무제한 자가 적립을 막는다. 잔액
-     * mutating 이 아닌 단순 SUM 조회라 lock 불필요.
-     */
-    fun adminGrantedCreditsSince(userId: UUID, since: Instant): Int =
-        grantedCreditsSince(userId, "admin", since)
-
-    /**
      * [userId] 가 [since] 이후 platform='admob' 으로 적립받은 크레딧 합 (= 보상형 광고 시청 횟수,
      * 1회당 1 크레딧). 광고 보상의 일일 상한 enforcement 용 — 하루에 광고로 받을 수 있는 크레딧을
      * 제한해 서버 분리 비용 과지출/어뷰징을 막는다.
@@ -128,8 +120,9 @@ class CreditRepository {
         grantedCreditsSince(userId, "admob", since)
 
     /**
-     * [userId] 가 [since] 이후 특정 [platform] 으로 적립받은 크레딧 합. admin/admob 일일 상한
-     * enforcement 가 공유. 잔액 mutating 이 아닌 단순 SUM 이라 lock 불필요.
+     * [userId] 가 [since] 이후 특정 [platform] 으로 적립받은 크레딧 합. 잔액 mutating 이 아닌
+     * 단순 SUM 이라 lock 불필요. (운영자 수동 지급의 상한은 수령자가 아니라 **지급자** 기준이라
+     * [AdminRepository.grantedByActorSince] 가 담당 — 여기서 세지 않는다.)
      */
     private fun grantedCreditsSince(userId: UUID, platform: String, since: Instant): Int = transaction {
         CreditTransactionsTable

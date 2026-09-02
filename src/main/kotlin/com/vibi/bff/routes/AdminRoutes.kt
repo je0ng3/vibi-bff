@@ -2,6 +2,9 @@ package com.vibi.bff.routes
 
 import com.vibi.bff.model.AdminBlockedRejoin
 import com.vibi.bff.model.AdminBlockedRejoinsResponse
+import com.vibi.bff.config.envOrProperty
+import com.vibi.bff.model.AdminGrantCreditsRequest
+import com.vibi.bff.model.AdminGrantCreditsResponse
 import com.vibi.bff.model.AdminSetRoleRequest
 import com.vibi.bff.model.AdminUnblockRejoinResponse
 import com.vibi.bff.model.AdminUserJobsResponse
@@ -9,6 +12,7 @@ import com.vibi.bff.model.AdminUsersResponse
 import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.requireAdmin
+import com.vibi.bff.service.AdminGrantResult
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.PersoQuotaCache
 import com.vibi.bff.service.UserRepository
@@ -24,6 +28,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.time.format.DateTimeParseException
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -32,11 +37,31 @@ import org.slf4j.LoggerFactory
 private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
 /**
- * `/api/v2/admin/...` — read-only 분석 surface. 모든 라우트 진입 시 [requireAdmin] 으로
+ * 수동 지급 1회당 상한. 오조작(0 하나 더 입력) 방어 — 더 큰 금액이 필요하면 나눠 지급한다.
+ * 24h 총량은 별도로 `ADMIN_GRANT_DAILY_CAP` (default 1000) 이 지급자 기준으로 제한.
+ */
+const val MAX_ADMIN_GRANT_PER_CALL = 500
+
+/** 지급 사유 최대 길이 — admin_audit_log.detail 컬럼(varchar 500) 보다 넉넉히 짧게. */
+private const val MAX_GRANT_REASON_LENGTH = 200
+
+/**
+ * 운영자 1인이 24h 동안 지급할 수 있는 크레딧 총량. admin JWT 유출 시 피해 상한.
+ * `/admin/users/{id}/credits` 와 `/credits/admin-grant` 가 **같은 한도를 공유**한다 — 한쪽으로
+ * 우회해 두 배를 발행하지 못하도록 (집계 소스도 admin_audit_log 하나).
+ *
+ * `.env` 로도 설정 가능해야 하므로 [envOrProperty] 사용 (System.getenv 만 보면 .env 가 무시된다).
+ */
+internal fun adminGrantDailyCap(): Int = envOrProperty("ADMIN_GRANT_DAILY_CAP")?.toIntOrNull() ?: 1000
+
+/**
+ * `/api/v2/admin/...` — 운영자 대시보드 surface. 모든 라우트 진입 시 [requireAdmin] 으로
  * role=admin JWT 강제. URL slug 숨김 (landing middleware) + role 검사 이중 방어.
  *
- * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). 유일한 mutating action 은 사용자 role
- * 승격/강등 (`POST /users/{userId}/role`) — 운영자가 일반 사용자를 admin 으로 올린다.
+ * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). mutating 은 셋 — 크레딧 수동 지급
+ * (`POST /users/{userId}/credits`), role 승격/강등 (`POST /users/{userId}/role`), 재가입 차단
+ * 해제 (`POST /blocked-rejoins/{hash}/unblock`). 셋 다 `admin_audit_log` 에 흔적을 남기고
+ * `GET /audit` 로 열람한다 — 운영자 권한 오남용의 사후 추적 경로.
  *
  * 주의 — KDoc 안에 slash + asterisk 시퀀스는 nested comment 로 파싱돼 컴파일 깨짐.
  * 와일드카드 표현 필요 시 "..." 으로 대체.
@@ -145,13 +170,7 @@ fun Route.adminRoutes(
         // 사용자별 render 잡 + 영상 당 분리 횟수.
         get("/users/{userId}/jobs") {
             call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val (limit, offset) = call.parsePagination()
             val (rows, total) = withContext(Dispatchers.IO) {
                 adminRepository.getUserJobs(userId, limit, offset)
@@ -162,29 +181,87 @@ fun Route.adminRoutes(
         // 사용자별 계정 연결/병합 정보 — 연결된 로그인 수단 + 이 계정으로 흡수된 병합 이력(이월 크레딧).
         get("/users/{userId}/account") {
             call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val data = withContext(Dispatchers.IO) { adminRepository.getUserAccount(userId) }
             call.respond(HttpStatusCode.OK, data)
         }
 
-        // 사용자 role 승격/강등 — 유일한 mutating admin 액션. body {role: 'admin'|'user'}.
+        // 사용자별 크레딧 변동 타임라인 — 가입 보너스/구매/광고/관리자 지급/분리 차감/환불/
+        // 병합 이월을 한 스트림으로 (최신순, limit·offset 공유 규약).
+        get("/users/{userId}/credits") {
+            call.requireAdmin(jwtSecret)
+            val userId = call.parseUserId()
+            val (limit, offset) = call.parsePagination()
+            val data = withContext(Dispatchers.IO) {
+                adminRepository.getUserCredits(userId, limit, offset)
+            }
+            call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 운영자 수동 크레딧 지급 — 결제 오류 보상 / 심사용 계정 충전 등. body {credits, reason}.
+        // 지급 즉시 잔액이 오르고 admin_audit_log 에 (지급자·수령자·수량·사유) 가 남으며, 같은
+        // 내역이 위 타임라인의 '관리자 지급' 이벤트로도 보인다.
+        //
+        // 사유(reason)를 필수로 받는 이유: 감사 로그의 값은 "왜" 에 있다. 사유 없는 지급은
+        // 나중에 부정 사용과 정상 보상을 구분할 수 없다.
+        post("/users/{userId}/credits") {
+            val principal = call.requireAdmin(jwtSecret)
+            val userId = call.parseUserId()
+            val body = call.receive<AdminGrantCreditsRequest>()
+            if (body.credits !in 1..MAX_ADMIN_GRANT_PER_CALL) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_credits", "1..$MAX_ADMIN_GRANT_PER_CALL")
+            }
+            val reason = body.reason.trim()
+            if (reason.isEmpty()) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "reason_required")
+            }
+            if (reason.length > MAX_GRANT_REASON_LENGTH) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "reason_too_long", "max $MAX_GRANT_REASON_LENGTH")
+            }
+
+            // 상한 검사는 repository 가 지급과 같은 트랜잭션 + 지급자 행 잠금 안에서 수행한다
+            // (여기서 미리 조회하면 검사와 지급 사이에 동시 요청이 끼어드는 TOCTOU 가 생긴다).
+            val result = withContext(Dispatchers.IO) {
+                adminRepository.grantCredits(
+                    targetUserId = userId,
+                    actorUserId = principal.userId,
+                    credits = body.credits,
+                    reason = reason,
+                    dailyCap = adminGrantDailyCap(),
+                )
+            }
+            when (result) {
+                is AdminGrantResult.TargetNotFound -> throw NotFoundException("user not found")
+                is AdminGrantResult.CapExceeded -> {
+                    adminLog.warn(
+                        "admin credit grant daily cap exceeded actor={} recent={} cap={}",
+                        principal.userId, result.grantedRecently, result.cap,
+                    )
+                    throw ApiErrorException(
+                        HttpStatusCode.TooManyRequests,
+                        "admin_grant_daily_cap_exceeded",
+                        "granted=${result.grantedRecently} cap=${result.cap} in 24h",
+                    )
+                }
+                is AdminGrantResult.Granted -> {
+                    adminLog.info(
+                        "admin credit grant: actor={} target={} +{} balance={}",
+                        principal.userId, userId, result.granted, result.balance,
+                    )
+                    call.respond(
+                        HttpStatusCode.OK,
+                        AdminGrantCreditsResponse(granted = result.granted, balance = result.balance),
+                    )
+                }
+            }
+        }
+
+        // 사용자 role 승격/강등. body {role: 'admin'|'user'}.
         // 자기 자신 role 변경은 차단 (마지막 운영자 자가 강등에 의한 lockout 방지 + 오조작 방어).
         // JWT 는 발급 시점 role 을 쓰므로 대상 사용자는 재로그인 후 반영 (AdminRepository.setUserRole 참조).
         post("/users/{userId}/role") {
             val principal = call.requireAdmin(jwtSecret)
-            val userIdParam = call.parameters["userId"]
-                ?: throw NotFoundException("userId required")
-            val userId = try {
-                UUID.fromString(userIdParam)
-            } catch (e: IllegalArgumentException) {
-                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
-            }
+            val userId = call.parseUserId()
             val body = call.receive<AdminSetRoleRequest>()
             if (body.role != "admin" && body.role != "user") {
                 throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_role")
@@ -193,10 +270,18 @@ fun Route.adminRoutes(
                 throw ApiErrorException(HttpStatusCode.BadRequest, "cannot_change_own_role")
             }
             val updated = withContext(Dispatchers.IO) {
-                adminRepository.setUserRole(userId, body.role)
+                adminRepository.setUserRoleAudited(userId, principal.userId, body.role)
             }
             if (updated == 0) throw NotFoundException("user not found")
             call.respond(HttpStatusCode.OK, AdminSetRoleRequest(role = body.role))
+        }
+
+        // 운영자 액션 감사 로그 (최신순) — 크레딧 지급 / role 변경 / 재가입 차단 해제.
+        get("/audit") {
+            call.requireAdmin(jwtSecret)
+            val (limit, offset) = call.parsePagination()
+            val data = withContext(Dispatchers.IO) { adminRepository.listAudit(limit, offset) }
+            call.respond(HttpStatusCode.OK, data)
         }
 
         // 탈퇴 후 재가입이 막혀 있는 identity 목록. PII 없음 — provider + 시각만으로 대상 특정.
@@ -221,17 +306,33 @@ fun Route.adminRoutes(
         // 차단 해제 — 실수 탈퇴 복구 / 앱 심사자 잠금 해제. 해제 즉시 재가입 가능해진다.
         // DELETE 대신 POST 인 이유: admin UI 의 mutating 액션이 모두 POST 규약(adminPost) 이다.
         post("/blocked-rejoins/{identityHash}/unblock") {
-            call.requireAdmin(jwtSecret)
+            val principal = call.requireAdmin(jwtSecret)
             val hash = call.parameters["identityHash"]
                 ?: throw NotFoundException("identityHash required")
             // PK 는 SHA-256 hex 64자 — 형식이 다르면 조회할 것도 없다.
             if (!hash.matches(Regex("[0-9a-f]{64}"))) {
                 throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_identity_hash")
             }
-            val unblocked = withContext(Dispatchers.IO) { userRepository.unblockRejoin(hash) }
+            // 해제와 감사 기록은 한 트랜잭션 (AdminRepository.unblockRejoinAudited).
+            val unblocked = withContext(Dispatchers.IO) {
+                adminRepository.unblockRejoinAudited(hash, principal.userId)
+            }
             adminLog.info("rejoin block lifted by admin: hash={} removed={}", hash.take(12), unblocked)
             call.respond(HttpStatusCode.OK, AdminUnblockRejoinResponse(unblocked = unblocked))
         }
+    }
+}
+
+/**
+ * `{userId}` path 파라미터를 UUID 로 파싱. 누락은 404, 형식 오류는 400 `invalid_user_id`.
+ * `/users/{userId}/...` 하위 핸들러들이 공유.
+ */
+private fun ApplicationCall.parseUserId(): UUID {
+    val raw = parameters["userId"] ?: throw NotFoundException("userId required")
+    return try {
+        UUID.fromString(raw)
+    } catch (e: IllegalArgumentException) {
+        throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_user_id")
     }
 }
 

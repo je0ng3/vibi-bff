@@ -62,7 +62,13 @@ export async function adminPost<T>(path: string, body: unknown): Promise<T> {
     throw new AdminAuthError("forbidden");
   }
   if (!res.ok) {
-    throw new Error(`BFF ${path} returned ${res.status}`);
+    // BFF 는 실패 시 ErrorResponse {error, detail} 을 준다. mutating 액션은 실패 사유
+    // (상한 초과 / 잘못된 값) 를 운영자에게 보여줘야 하므로 error 코드를 그대로 던진다.
+    const code = await res
+      .json()
+      .then((body: { error?: string }) => body?.error)
+      .catch(() => undefined);
+    throw new Error(code ?? `BFF ${path} returned ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -157,18 +163,42 @@ export interface AdminLinkedIdentity {
   primary: boolean;
 }
 
-/** 이 계정으로 흡수된 병합 1건. carriedCredits=이월 크레딧(무료 보너스 제외분, 0 가능). */
-export interface AdminAccountMerge {
-  fromProvider: string;
-  fromEmail: string;
-  carriedCredits: number;
-  mergedAt: string;
-}
-
-/** 사용자 상세 페이지의 계정 연결/병합 정보. */
+/**
+ * 사용자 상세 페이지의 계정 연결 정보. 병합 이력은 크레딧 타임라인의 'merge_carry' 이벤트가
+ * 정본이라 여기 담기지 않는다.
+ */
 export interface AdminUserAccount {
   identities: AdminLinkedIdentity[];
-  merges: AdminAccountMerge[];
+}
+
+/**
+ * 크레딧 변동 1건. type 은 'signup' | 'purchase' | 'ad_reward' | 'admin_grant' |
+ * 'separation' | 'refund' | 'merge_carry'. delta 는 부호 포함 (분리 차감만 음수).
+ * jobId/sourceDurationMs 는 separation·refund 에서만 채워진다 (잡 row 가 남아있을 때).
+ */
+export interface AdminCreditEvent {
+  /** "<소스>:<PK>" 전역 유니크 키 (tx:12 / ledger:34 / merge:5). 목록 key + append 중복 제거용. */
+  id: string;
+  at: string;
+  type: string;
+  delta: number;
+  detail: string | null;
+  /** admin_grant 를 실행한 운영자 이메일. 감사 row 가 없는 옛 지급분은 null. */
+  actor: string | null;
+  jobId: string | null;
+  sourceDurationMs: number | null;
+}
+
+/**
+ * 크레딧 타임라인 응답. balance 는 user_credits 의 실제 잔액이고, hasMerges 가 true 면
+ * 이벤트 delta 합계와 일치하지 않을 수 있다 — 병합으로 흡수된 계정의 결제 이력이 감사 보존을
+ * 위해 re-point 되지만 잔액에 더해진 건 이월분뿐이기 때문 (BFF AdminUserCreditsResponse KDoc).
+ */
+export interface AdminUserCreditsResponse {
+  balance: number;
+  events: AdminCreditEvent[];
+  total: number;
+  hasMerges: boolean;
 }
 
 export interface AdminExternalCallDaily {
@@ -256,4 +286,39 @@ export interface AdminBlockedRejoinsResponse {
 
 export interface AdminUnblockRejoinResponse {
   unblocked: boolean;
+}
+
+/**
+ * 운영자 수동 크레딧 지급 요청/응답 (`POST /admin/users/{id}/credits`).
+ * reason 은 필수 — 감사 로그의 핵심 값이라 서버가 빈 문자열을 거부한다.
+ */
+export interface AdminGrantCreditsRequest {
+  credits: number;
+  reason: string;
+}
+
+export interface AdminGrantCreditsResponse {
+  granted: number;
+  balance: number;
+}
+
+/**
+ * 감사 로그 1건. action 별로 컬럼 의미가 다르다 —
+ * credit_grant(amount=지급 크레딧, detail=사유) / set_role(detail=새 role) /
+ * unblock_rejoin(detail=identity 해시, targetEmail 없음).
+ */
+export interface AdminAuditEntry {
+  id: number;
+  at: string;
+  actorEmail: string;
+  action: string;
+  targetUserId: string | null;
+  targetEmail: string | null;
+  amount: number | null;
+  detail: string | null;
+}
+
+export interface AdminAuditResponse {
+  entries: AdminAuditEntry[];
+  total: number;
 }

@@ -7,15 +7,17 @@ import JobsPage from "./pages/JobsPage";
 import UsersPage from "./pages/UsersPage";
 import UserDetailPage from "./pages/UserDetailPage";
 import BlockedRejoinsPage from "./pages/BlockedRejoinsPage";
+import AuditPage from "./pages/AuditPage";
 
-// 상단 메뉴 — Overview(헬스) · Jobs(운영) · Analytics(추이) · Users(+액션) · 재가입 차단(해제).
-// 순서 = 표시 순서.
+// 상단 메뉴 — Overview(헬스) · Jobs(운영) · Analytics(추이) · Users(+액션) · 재가입 차단(해제) ·
+// 감사 로그(운영자 액션 이력). 순서 = 표시 순서.
 const NAV: { to: string; label: string; end: boolean }[] = [
   { to: "/", label: "Overview", end: true },
   { to: "/jobs", label: "Jobs", end: false },
   { to: "/analytics", label: "Analytics", end: false },
   { to: "/users", label: "Users", end: false },
   { to: "/blocked-rejoins", label: "재가입 차단", end: false },
+  { to: "/audit", label: "감사 로그", end: false },
 ];
 
 export default function App() {
@@ -84,6 +86,7 @@ export default function App() {
           <Route path="/users" element={<RequireAuth><UsersPage /></RequireAuth>} />
           <Route path="/users/:id" element={<RequireAuth><UserDetailPage /></RequireAuth>} />
           <Route path="/blocked-rejoins" element={<RequireAuth><BlockedRejoinsPage /></RequireAuth>} />
+          <Route path="/audit" element={<RequireAuth><AuditPage /></RequireAuth>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
