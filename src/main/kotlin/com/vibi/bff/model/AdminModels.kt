@@ -94,8 +94,9 @@ data class AdminUserAccount(
  *   'admin_grant'(관리자 지급) / 'separation'(음원분리 차감) / 'refund'(분리 실패 환불) /
  *   'merge_carry'(계정 병합 이월).
  * - [delta] — 부호 포함 변동량. 차감(separation)만 음수, 나머지는 양수 (병합 이월은 0 일 수 있다).
- * - [detail] — 타입별 보조 표시값. purchase/ad_reward/admin_grant 는 product_id,
- *   merge_carry 는 "provider:email" (흡수된 계정). 없으면 null.
+ * - [detail] — 타입별 보조 표시값. purchase/ad_reward 는 product_id, admin_grant 는 운영자가
+ *   입력한 사유(admin_audit_log), merge_carry 는 "provider:email" (흡수된 계정). 없으면 null.
+ * - [actor] — admin_grant 에서 지급한 운영자 이메일. 감사 row 가 없는 옛 지급분은 null.
  * - [jobId] / [sourceDurationMs] — separation·refund 에서 해당 분리 잡과 입력 길이.
  *   잡 row 가 이미 사라졌거나(탈퇴 익명화) 다른 타입이면 null.
  */
@@ -106,6 +107,7 @@ data class AdminCreditEvent(
     val type: String,
     val delta: Int,
     val detail: String? = null,
+    val actor: String? = null,
     val jobId: String? = null,
     val sourceDurationMs: Long? = null,
 )
@@ -275,6 +277,26 @@ data class AdminDeletionDaily(
 @Serializable
 data class AdminSetRoleRequest(
     val role: String,
+)
+
+/**
+ * 운영자 수동 크레딧 지급 요청 (`POST /admin/users/{id}/credits`).
+ *
+ * - [credits] — 지급 수량. 1..[com.vibi.bff.routes.MAX_ADMIN_GRANT_PER_CALL] (라우트에서 검증).
+ * - [reason] — 지급 사유. **필수** — 감사 로그의 핵심 값이라 빈 문자열을 거부한다
+ *   (예: "결제 오류 보상", "심사용 계정 충전").
+ */
+@Serializable
+data class AdminGrantCreditsRequest(
+    val credits: Int,
+    val reason: String,
+)
+
+/** 지급 결과 — [granted] 만큼 올라간 뒤의 [balance]. */
+@Serializable
+data class AdminGrantCreditsResponse(
+    val granted: Int,
+    val balance: Int,
 )
 
 /**

@@ -62,7 +62,13 @@ export async function adminPost<T>(path: string, body: unknown): Promise<T> {
     throw new AdminAuthError("forbidden");
   }
   if (!res.ok) {
-    throw new Error(`BFF ${path} returned ${res.status}`);
+    // BFF 는 실패 시 ErrorResponse {error, detail} 을 준다. mutating 액션은 실패 사유
+    // (상한 초과 / 잘못된 값) 를 운영자에게 보여줘야 하므로 error 코드를 그대로 던진다.
+    const code = await res
+      .json()
+      .then((body: { error?: string }) => body?.error)
+      .catch(() => undefined);
+    throw new Error(code ?? `BFF ${path} returned ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -177,6 +183,8 @@ export interface AdminCreditEvent {
   type: string;
   delta: number;
   detail: string | null;
+  /** admin_grant 를 실행한 운영자 이메일. 감사 row 가 없는 옛 지급분은 null. */
+  actor: string | null;
   jobId: string | null;
   sourceDurationMs: number | null;
 }
@@ -278,6 +286,20 @@ export interface AdminBlockedRejoinsResponse {
 
 export interface AdminUnblockRejoinResponse {
   unblocked: boolean;
+}
+
+/**
+ * 운영자 수동 크레딧 지급 요청/응답 (`POST /admin/users/{id}/credits`).
+ * reason 은 필수 — 감사 로그의 핵심 값이라 서버가 빈 문자열을 거부한다.
+ */
+export interface AdminGrantCreditsRequest {
+  credits: number;
+  reason: string;
+}
+
+export interface AdminGrantCreditsResponse {
+  granted: number;
+  balance: number;
 }
 
 /**

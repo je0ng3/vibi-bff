@@ -1,6 +1,7 @@
 package com.vibi.bff.service
 
 import com.vibi.bff.db.AdminAuditLogTable
+import com.vibi.bff.db.CreditTransactionsTable
 import com.vibi.bff.db.UserIdentitiesTable
 import com.vibi.bff.db.UsersTable
 import com.vibi.bff.model.AdminActiveJob
@@ -23,12 +24,15 @@ import com.vibi.bff.model.AdminUserCreditsResponse
 import com.vibi.bff.model.AdminUserOverview
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import org.jetbrains.exposed.sql.IColumnType
 import org.jetbrains.exposed.sql.IntegerColumnType
+import org.jetbrains.exposed.sql.LongColumnType
 import org.jetbrains.exposed.sql.TextColumnType
 import org.jetbrains.exposed.sql.UUIDColumnType
 import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.insertAndGetId
 import org.jetbrains.exposed.sql.javatime.JavaInstantColumnType
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -38,11 +42,13 @@ private val INSTANT_T = JavaInstantColumnType()
 private val TEXT_T = TextColumnType()
 private val INT_T = IntegerColumnType()
 private val UUID_T = UUIDColumnType()
+private val LONG_T = LongColumnType()
 
 private fun instantArg(v: Instant): Pair<IColumnType<*>, Any?> = INSTANT_T to v
 private fun textArg(v: String): Pair<IColumnType<*>, Any?> = TEXT_T to v
 private fun intArg(v: Int): Pair<IColumnType<*>, Any?> = INT_T to v
 private fun uuidArg(v: UUID): Pair<IColumnType<*>, Any?> = UUID_T to v
+private fun longArg(v: Long): Pair<IColumnType<*>, Any?> = LONG_T to v
 
 private fun scalarLong(sql: String, args: List<Pair<IColumnType<*>, Any?>> = emptyList()): Long =
     TransactionManager.current().exec(sql, args = args) { rs ->
@@ -51,6 +57,24 @@ private fun scalarLong(sql: String, args: List<Pair<IColumnType<*>, Any?>> = emp
 
 /** 소수 첫째 자리 반올림 — 체류기간(일) 표시용. */
 private fun round1(v: Double): Double = Math.round(v * 10.0) / 10.0
+
+/** 운영자 수동 지급 row 의 credit_transactions.product_id — IAP SKU 가 아님을 나타내는 표식. */
+const val ADMIN_GRANT_PRODUCT_ID = "admin.grant"
+
+/**
+ * [AdminRepository.grantCredits] 결과. 실패 사유를 예외 대신 타입으로 돌려주는 이유: 둘 다
+ * 정상적인 운영 흐름(오타난 userId / 한도 도달)이고, 라우트가 각각 404·429 로 다르게 매핑해야 한다.
+ */
+sealed interface AdminGrantResult {
+    /** 지급 성공. [transactionId] 는 credit_transactions 의 서버 생성 키 (응답 echo 용). */
+    data class Granted(val granted: Int, val balance: Int, val transactionId: String) : AdminGrantResult
+
+    /** 대상 사용자 없음 (오타 / 이미 탈퇴). */
+    data object TargetNotFound : AdminGrantResult
+
+    /** 지급자의 24h 상한 초과. [grantedRecently] 는 창 안에서 이미 지급한 합. */
+    data class CapExceeded(val grantedRecently: Int, val cap: Int) : AdminGrantResult
+}
 
 /**
  * `admin_audit_log.action` 값. 컬럼별 의미는 action 마다 다르다 —
@@ -71,8 +95,8 @@ private fun medianOf(values: List<Long>): Double {
 }
 
 /**
- * admin 대시보드 쿼리. 대부분 read-only 집계이고, mutating 은 [setUserRole] 과 재가입 차단
- * 해제뿐이다. mutating 액션은 전부 `admin_audit_log` 에 흔적을 남긴다.
+ * admin 대시보드 쿼리. 대부분 read-only 집계이고, mutating 은 셋뿐 — [setUserRole],
+ * [grantCredits], [recordAudit]. mutating 액션은 전부 `admin_audit_log` 에 흔적을 남긴다.
  *
  * 집계 쿼리는 raw SQL — Exposed 의 group-by/aggregation API 로도 가능하나 raw 가 가독성 우위.
  * Postgres + H2 (PostgreSQL mode) 양쪽에서 동일 구문이 동작하는지 확인된 SQL 만 사용.
@@ -711,6 +735,34 @@ class AdminRepository(
             }
         }
 
+        // 관리자 지급의 사유·지급자는 admin_audit_log 에만 있다 (credit_transactions 에는 넣을
+        // 컬럼이 없고, product_id 를 사유로 전용하면 카탈로그 의미가 깨진다). 잡 길이와 같은
+        // 방식으로 페이지에 뜬 tx PK 만 bounded 조회 — UNION 안에서 조인하지 않는다.
+        val grantTxIds = events
+            .filter { it.type == "admin_grant" }
+            .mapNotNull { it.id.removePrefix("tx:").toLongOrNull() }
+        if (grantTxIds.isNotEmpty()) {
+            val audits = HashMap<Long, Pair<String?, String>>(grantTxIds.size)
+            val placeholders = grantTxIds.joinToString(", ") { "?" }
+            TransactionManager.current().exec(
+                "SELECT credit_transaction_id, detail, actor_email FROM admin_audit_log " +
+                    "WHERE credit_transaction_id IN ($placeholders)",
+                args = grantTxIds.map { longArg(it) },
+            ) { rs ->
+                while (rs.next()) {
+                    audits[rs.getLong("credit_transaction_id")] =
+                        rs.getString("detail") to rs.getString("actor_email")
+                }
+            }
+            events.replaceAll { e ->
+                if (e.type != "admin_grant") return@replaceAll e
+                val hit = e.id.removePrefix("tx:").toLongOrNull()?.let { audits[it] }
+                    ?: return@replaceAll e
+                // 사유가 비어있으면(옛 /credits/admin-grant 경로) product_id 를 그대로 둔다.
+                e.copy(detail = hit.first ?: e.detail, actor = hit.second)
+            }
+        }
+
         AdminUserCreditsResponse(
             balance = balance,
             events = events,
@@ -765,8 +817,90 @@ class AdminRepository(
     }
 
     /**
+     * 운영자 수동 크레딧 지급. 상한 검사 → 지급 → 감사 기록을 **한 트랜잭션**으로 묶는다.
+     *
+     * 원자성이 load-bearing 인 이유가 둘이다:
+     *  1. 크레딧만 오르고 감사 row 가 없는(= 추적 불가능한) 상태를 만들지 않는다.
+     *  2. 24h 상한 검사와 지급이 같은 트랜잭션 + 같은 행 잠금 안에서 일어나야 동시 요청 2건이
+     *     같은 잔여 한도를 읽고 둘 다 통과하는 TOCTOU 가 없다. 지급자(users) row 를
+     *     `SELECT ... FOR UPDATE` 로 잠가 **같은 운영자의 지급끼리만** 직렬화한다 (다른 운영자는
+     *     서로 막지 않는다). 상한이 임의 금액 지급의 유일한 방어선이라 검사-후-삽입 사이에 틈을
+     *     두지 않는다.
+     *
+     * IAP 경로와 같은 (platform='admin', transaction_id) UNIQUE 를 쓰지만 transaction_id 를
+     * 서버가 생성하므로 충돌은 없다 (호출 1회 = 지급 1회. 중복 제출 방어는 호출자 책임).
+     *
+     * platform='admin' 으로 남는 덕에 계정 병합의 "획득 크레딧" SUM
+     * ([UserRepository.mergeAccounts])에도 포함된다 — 운영자가 보상한 크레딧은 무료 보너스와
+     * 달리 병합 시 이월 대상이라는 의미이며, 이는 의도된 동작이다.
+     *
+     * 사용자 대면 `POST /credits/admin-grant` (운영자 자가 충전) 도 이 메서드를 탄다 — 두 경로가
+     * 같은 24h 한도·같은 감사 로그를 공유하게 해 한쪽으로 우회하지 못하도록.
+     */
+    fun grantCredits(
+        targetUserId: UUID,
+        actorUserId: UUID,
+        credits: Int,
+        reason: String,
+        dailyCap: Int,
+    ): AdminGrantResult = transaction {
+        require(credits > 0) { "credits must be positive (got $credits)" }
+
+        // 지급자 row 잠금 — 아래 SUM 과 INSERT 사이를 같은 운영자 기준으로 직렬화. 운영자 계정이
+        // 이미 삭제된 stale JWT 면 잠글 row 가 없어 직렬화가 없지만, 그 경우 상한 SUM 도
+        // (actor_user_id NULL 로 끊겨) 0 이라 어차피 의미가 없다.
+        UsersTable
+            .select(UsersTable.id)
+            .where { UsersTable.id eq actorUserId }
+            .forUpdate()
+            .singleOrNull()
+
+        val grantedRecently = grantedByActorSinceInTx(
+            actorUserId,
+            Instant.now().minus(24, ChronoUnit.HOURS),
+        )
+        if (grantedRecently + credits > dailyCap) {
+            return@transaction AdminGrantResult.CapExceeded(grantedRecently = grantedRecently, cap = dailyCap)
+        }
+
+        val exists = UsersTable
+            .select(UsersTable.id)
+            .where { UsersTable.id eq targetUserId }
+            .limit(1)
+            .empty()
+            .not()
+        if (!exists) return@transaction AdminGrantResult.TargetNotFound
+
+        val now = Instant.now()
+        val transactionId = "admin-" + UUID.randomUUID()
+        val txRowId = CreditTransactionsTable.insertAndGetId {
+            it[CreditTransactionsTable.userId] = targetUserId
+            it[CreditTransactionsTable.platform] = "admin"
+            it[CreditTransactionsTable.transactionId] = transactionId
+            it[CreditTransactionsTable.productId] = ADMIN_GRANT_PRODUCT_ID
+            it[CreditTransactionsTable.credits] = credits
+            it[CreditTransactionsTable.createdAt] = now
+        }.value
+        addToBalance(targetUserId, credits, now)
+        recordAudit(
+            actorUserId = actorUserId,
+            action = AdminAuditAction.CREDIT_GRANT,
+            targetUserId = targetUserId,
+            amount = credits,
+            detail = reason,
+            creditTransactionId = txRowId,
+            now = now,
+        )
+        AdminGrantResult.Granted(
+            granted = credits,
+            balance = readBalance(targetUserId),
+            transactionId = transactionId,
+        )
+    }
+
+    /**
      * role 변경 + 감사 기록을 한 트랜잭션으로. 갱신 row 수(0 = 존재하지 않는 사용자) 반환.
-     * 변경만 커밋되고 감사 기록이 유실되는 창을 없앤다.
+     * 변경만 커밋되고 감사 기록이 유실되는 창을 없앤다 ([grantCredits] 와 같은 규약).
      */
     fun setUserRoleAudited(userId: UUID, actorUserId: UUID, role: String): Int = transaction {
         val updated = setUserRole(userId, role)
@@ -803,9 +937,9 @@ class AdminRepository(
      * 감사 로그 1건 적재 (append-only). [actorUserId] 의 이메일은 지금 조회해 denormalize —
      * 운영자 계정이 나중에 삭제돼도 "누가 했는지" 가 남는다 (삭제 정책의 의도적 예외. V19 주석 참조).
      *
-     * **직접 호출보다 액션별 래퍼를 쓸 것** ([setUserRoleAudited] · [unblockRejoinAudited]) —
-     * 변경과 기록이 한 트랜잭션으로 묶여야 "변경은 됐는데 기록은 없는" 상태가 생기지 않는다.
-     * 이 메서드는 그 래퍼들이 쓰는 프리미티브다.
+     * **직접 호출보다 액션별 래퍼를 쓸 것** ([grantCredits] · [setUserRoleAudited] ·
+     * [unblockRejoinAudited]) — 변경과 기록이 한 트랜잭션으로 묶여야 "변경은 됐는데 기록은 없는"
+     * 상태가 생기지 않는다. 이 메서드는 그 래퍼들이 쓰는 프리미티브다.
      *
      * action 별 컬럼 의미:
      *   • credit_grant   — [targetUserId]=수령자, [amount]=지급 크레딧, [detail]=사유, [creditTransactionId] 채움
@@ -845,6 +979,26 @@ class AdminRepository(
             }
         }
     }
+
+    /**
+     * [actorUserId] 가 [since] 이후 수동 지급한 크레딧 합. 지급자 기준 24h 상한 enforcement 용 —
+     * admin JWT 가 유출돼도 무제한 발행을 막는다. **수령자가 아니라 지급한 쪽**을 세는 것이
+     * 핵심 (여러 계정에 나눠 지급해 상한을 우회하는 경로 차단).
+     *
+     * 상한 검사는 [grantCredits] 가 자기 트랜잭션 안에서 수행하므로, 이 public 진입점은 조회
+     * (대시보드/디버깅) 전용이다.
+     */
+    fun grantedByActorSince(actorUserId: UUID, since: Instant): Int = transaction {
+        grantedByActorSinceInTx(actorUserId, since)
+    }
+
+    /** [grantedByActorSince] 의 본체 — 열린 트랜잭션 안에서 호출. */
+    private fun grantedByActorSinceInTx(actorUserId: UUID, since: Instant): Int =
+        scalarLong(
+            "SELECT COALESCE(SUM(amount), 0) FROM admin_audit_log " +
+                "WHERE actor_user_id = ? AND action = ? AND created_at >= ?",
+            listOf(uuidArg(actorUserId), textArg(AdminAuditAction.CREDIT_GRANT), instantArg(since)),
+        ).toInt()
 
     /**
      * 감사 로그 페이지 (최신순) + 전체 건수. 대상 이메일은 현재 users row 에서 채우므로

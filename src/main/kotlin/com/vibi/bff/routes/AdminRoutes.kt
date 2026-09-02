@@ -2,6 +2,9 @@ package com.vibi.bff.routes
 
 import com.vibi.bff.model.AdminBlockedRejoin
 import com.vibi.bff.model.AdminBlockedRejoinsResponse
+import com.vibi.bff.config.envOrProperty
+import com.vibi.bff.model.AdminGrantCreditsRequest
+import com.vibi.bff.model.AdminGrantCreditsResponse
 import com.vibi.bff.model.AdminSetRoleRequest
 import com.vibi.bff.model.AdminUnblockRejoinResponse
 import com.vibi.bff.model.AdminUserJobsResponse
@@ -9,6 +12,7 @@ import com.vibi.bff.model.AdminUsersResponse
 import com.vibi.bff.plugins.ApiErrorException
 import com.vibi.bff.plugins.NotFoundException
 import com.vibi.bff.plugins.requireAdmin
+import com.vibi.bff.service.AdminGrantResult
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.PersoQuotaCache
 import com.vibi.bff.service.UserRepository
@@ -24,6 +28,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
 import java.time.format.DateTimeParseException
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -32,13 +37,31 @@ import org.slf4j.LoggerFactory
 private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
 /**
+ * 수동 지급 1회당 상한. 오조작(0 하나 더 입력) 방어 — 더 큰 금액이 필요하면 나눠 지급한다.
+ * 24h 총량은 별도로 `ADMIN_GRANT_DAILY_CAP` (default 1000) 이 지급자 기준으로 제한.
+ */
+const val MAX_ADMIN_GRANT_PER_CALL = 500
+
+/** 지급 사유 최대 길이 — admin_audit_log.detail 컬럼(varchar 500) 보다 넉넉히 짧게. */
+private const val MAX_GRANT_REASON_LENGTH = 200
+
+/**
+ * 운영자 1인이 24h 동안 지급할 수 있는 크레딧 총량. admin JWT 유출 시 피해 상한.
+ * `/admin/users/{id}/credits` 와 `/credits/admin-grant` 가 **같은 한도를 공유**한다 — 한쪽으로
+ * 우회해 두 배를 발행하지 못하도록 (집계 소스도 admin_audit_log 하나).
+ *
+ * `.env` 로도 설정 가능해야 하므로 [envOrProperty] 사용 (System.getenv 만 보면 .env 가 무시된다).
+ */
+internal fun adminGrantDailyCap(): Int = envOrProperty("ADMIN_GRANT_DAILY_CAP")?.toIntOrNull() ?: 1000
+
+/**
  * `/api/v2/admin/...` — 운영자 대시보드 surface. 모든 라우트 진입 시 [requireAdmin] 으로
  * role=admin JWT 강제. URL slug 숨김 (landing middleware) + role 검사 이중 방어.
  *
- * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). mutating 은 둘 — role 승격/강등
- * (`POST /users/{userId}/role`), 재가입 차단 해제 (`POST /blocked-rejoins/{hash}/unblock`).
- * 둘 다 `admin_audit_log` 에 흔적을 남기고 `GET /audit` 로 열람한다 — 운영자 권한 오남용의
- * 사후 추적 경로.
+ * 대부분 read-only (KPI / 추세 / 사용자·잡 목록). mutating 은 셋 — 크레딧 수동 지급
+ * (`POST /users/{userId}/credits`), role 승격/강등 (`POST /users/{userId}/role`), 재가입 차단
+ * 해제 (`POST /blocked-rejoins/{hash}/unblock`). 셋 다 `admin_audit_log` 에 흔적을 남기고
+ * `GET /audit` 로 열람한다 — 운영자 권한 오남용의 사후 추적 경로.
  *
  * 주의 — KDoc 안에 slash + asterisk 시퀀스는 nested comment 로 파싱돼 컴파일 깨짐.
  * 와일드카드 표현 필요 시 "..." 으로 대체.
@@ -173,6 +196,64 @@ fun Route.adminRoutes(
                 adminRepository.getUserCredits(userId, limit, offset)
             }
             call.respond(HttpStatusCode.OK, data)
+        }
+
+        // 운영자 수동 크레딧 지급 — 결제 오류 보상 / 심사용 계정 충전 등. body {credits, reason}.
+        // 지급 즉시 잔액이 오르고 admin_audit_log 에 (지급자·수령자·수량·사유) 가 남으며, 같은
+        // 내역이 위 타임라인의 '관리자 지급' 이벤트로도 보인다.
+        //
+        // 사유(reason)를 필수로 받는 이유: 감사 로그의 값은 "왜" 에 있다. 사유 없는 지급은
+        // 나중에 부정 사용과 정상 보상을 구분할 수 없다.
+        post("/users/{userId}/credits") {
+            val principal = call.requireAdmin(jwtSecret)
+            val userId = call.parseUserId()
+            val body = call.receive<AdminGrantCreditsRequest>()
+            if (body.credits !in 1..MAX_ADMIN_GRANT_PER_CALL) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "invalid_credits", "1..$MAX_ADMIN_GRANT_PER_CALL")
+            }
+            val reason = body.reason.trim()
+            if (reason.isEmpty()) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "reason_required")
+            }
+            if (reason.length > MAX_GRANT_REASON_LENGTH) {
+                throw ApiErrorException(HttpStatusCode.BadRequest, "reason_too_long", "max $MAX_GRANT_REASON_LENGTH")
+            }
+
+            // 상한 검사는 repository 가 지급과 같은 트랜잭션 + 지급자 행 잠금 안에서 수행한다
+            // (여기서 미리 조회하면 검사와 지급 사이에 동시 요청이 끼어드는 TOCTOU 가 생긴다).
+            val result = withContext(Dispatchers.IO) {
+                adminRepository.grantCredits(
+                    targetUserId = userId,
+                    actorUserId = principal.userId,
+                    credits = body.credits,
+                    reason = reason,
+                    dailyCap = adminGrantDailyCap(),
+                )
+            }
+            when (result) {
+                is AdminGrantResult.TargetNotFound -> throw NotFoundException("user not found")
+                is AdminGrantResult.CapExceeded -> {
+                    adminLog.warn(
+                        "admin credit grant daily cap exceeded actor={} recent={} cap={}",
+                        principal.userId, result.grantedRecently, result.cap,
+                    )
+                    throw ApiErrorException(
+                        HttpStatusCode.TooManyRequests,
+                        "admin_grant_daily_cap_exceeded",
+                        "granted=${result.grantedRecently} cap=${result.cap} in 24h",
+                    )
+                }
+                is AdminGrantResult.Granted -> {
+                    adminLog.info(
+                        "admin credit grant: actor={} target={} +{} balance={}",
+                        principal.userId, userId, result.granted, result.balance,
+                    )
+                    call.respond(
+                        HttpStatusCode.OK,
+                        AdminGrantCreditsResponse(granted = result.granted, balance = result.balance),
+                    )
+                }
+            }
         }
 
         // 사용자 role 승격/강등. body {role: 'admin'|'user'}.

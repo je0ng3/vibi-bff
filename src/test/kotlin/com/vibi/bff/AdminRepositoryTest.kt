@@ -3,6 +3,7 @@ package com.vibi.bff
 import com.vibi.bff.config.DbConfig
 import com.vibi.bff.db.DbBootstrap
 import com.vibi.bff.model.AuthProvider
+import com.vibi.bff.service.AdminGrantResult
 import com.vibi.bff.service.AdminRepository
 import com.vibi.bff.service.CreditRepository
 import com.vibi.bff.service.SIGNUP_BONUS_CREDITS
@@ -95,6 +96,15 @@ class AdminRepositoryTest {
      * 여전히 admin 을 거부한다(V9 주석). CHECK_CLAUSE 에 'apple' 이 들어간 제약을 모두 드롭 —
      * credits>0 제약은 'apple' 을 포함 안 해 보존된다.
      */
+    /** 상한을 매번 넘기지 않도록 한 겹 — 대부분의 테스트는 상한이 관심사가 아니다. */
+    private fun grant(
+        targetUserId: UUID,
+        actorUserId: UUID,
+        credits: Int,
+        reason: String,
+        dailyCap: Int = 1000,
+    ) = admin.grantCredits(targetUserId, actorUserId, credits, reason, dailyCap)
+
     private fun allowAdminPlatformInH2() = transaction {
         val names = mutableListOf<String>()
         exec(
@@ -561,20 +571,98 @@ class AdminRepositoryTest {
         assertTrue(res.events.sumOf { it.delta } > res.balance)
     }
 
-    // ── 감사 로그 ────────────────────────────────────────────────────────────
+    // ── grantCredits / 감사 로그 ─────────────────────────────────────────────
+
+    @Test
+    fun `grantCredits raises the balance and records who granted why`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val target = users.upsert(AuthProvider.GOOGLE, "g-user", "u@example.com", "User", null)
+        credits.grantSignupBonus(target.id)
+
+        val res = grant(target.id, actor.id, 7, "분리 실패 보상") as AdminGrantResult.Granted
+
+        assertEquals(7, res.granted)
+        assertEquals(SIGNUP_BONUS_CREDITS + 7, res.balance)
+        assertEquals(SIGNUP_BONUS_CREDITS + 7, credits.balance(target.id))
+        assertTrue(res.transactionId.startsWith("admin-"))
+
+        // 타임라인에 사유·지급자가 붙어 나온다 (감사 로그 join).
+        val event = admin.getUserCredits(target.id, 50, 0).events.single { it.type == "admin_grant" }
+        assertEquals(7, event.delta)
+        assertEquals("분리 실패 보상", event.detail)
+        assertEquals("ops@example.com", event.actor)
+
+        // 감사 로그 페이지에도 같은 1건.
+        val audit = admin.listAudit(50, 0).entries.single()
+        assertEquals("credit_grant", audit.action)
+        assertEquals("ops@example.com", audit.actorEmail)
+        assertEquals(target.id.toString(), audit.targetUserId)
+        assertEquals("u@example.com", audit.targetEmail)
+        assertEquals(7, audit.amount)
+        assertEquals("분리 실패 보상", audit.detail)
+    }
+
+    @Test
+    fun `grantCredits reports an unknown target and writes nothing`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+
+        assertEquals(AdminGrantResult.TargetNotFound, grant(UUID.randomUUID(), actor.id, 5, "오타"))
+
+        // 지급이 없었으니 감사 row 도 없어야 한다 (한 트랜잭션 안에서 존재 확인 → insert).
+        assertEquals(0, admin.listAudit(50, 0).entries.size)
+    }
+
+    @Test
+    fun `grantCredits refuses to exceed the granting admin's daily cap`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val t1 = users.upsert(AuthProvider.GOOGLE, "g-u1", "u1@example.com", "U1", null)
+        val t2 = users.upsert(AuthProvider.GOOGLE, "g-u2", "u2@example.com", "U2", null)
+
+        assertTrue(grant(t1.id, actor.id, 8, "1차", dailyCap = 10) is AdminGrantResult.Granted)
+        // 상한은 지급자 기준 합산 — 다른 계정으로 나눠 지급해도 우회되지 않는다.
+        val denied = grant(t2.id, actor.id, 5, "2차", dailyCap = 10)
+        assertEquals(AdminGrantResult.CapExceeded(grantedRecently = 8, cap = 10), denied)
+        assertEquals(0, credits.balance(t2.id))
+        assertEquals(1, admin.listAudit(50, 0).total) // 거부된 시도는 기록하지 않는다
+    }
+
+    @Test
+    fun `grantedByActorSince sums only that admin's grants inside the window`() {
+        allowAdminPlatformInH2()
+        val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
+        val other = users.upsert(AuthProvider.GOOGLE, "g-admin2", "ops2@example.com", "Ops2", null)
+        val t1 = users.upsert(AuthProvider.GOOGLE, "g-u1", "u1@example.com", "U1", null)
+        val t2 = users.upsert(AuthProvider.GOOGLE, "g-u2", "u2@example.com", "U2", null)
+
+        // 같은 운영자가 서로 다른 계정에 나눠 지급해도 합산된다 (계정 분산 우회 차단).
+        grant(t1.id, actor.id, 4, "보상")
+        grant(t2.id, actor.id, 6, "보상")
+        grant(t1.id, other.id, 100, "다른 운영자")
+
+        val since = Instant.now().minusSeconds(3600)
+        assertEquals(10, admin.grantedByActorSince(actor.id, since))
+        assertEquals(100, admin.grantedByActorSince(other.id, since))
+        // 창 밖(미래 기준 since)은 0.
+        assertEquals(0, admin.grantedByActorSince(actor.id, Instant.now().plusSeconds(60)))
+    }
 
     @Test
     fun `listAudit returns newest first across action types`() {
+        allowAdminPlatformInH2()
         val actor = users.upsert(AuthProvider.GOOGLE, "g-admin", "ops@example.com", "Ops", null)
         val target = users.upsert(AuthProvider.GOOGLE, "g-user", "u@example.com", "User", null)
 
+        grant(target.id, actor.id, 3, "테스트 충전")
         admin.setUserRoleAudited(target.id, actor.id, "admin")
         // 대상이 사용자 row 가 아닌 액션 — target 은 비고 detail 에 해시만 남는다.
         admin.recordAudit(actor.id, "unblock_rejoin", detail = "a".repeat(64))
 
         val res = admin.listAudit(50, 0)
-        assertEquals(2, res.total)
-        assertEquals(listOf("unblock_rejoin", "set_role"), res.entries.map { it.action })
+        assertEquals(3, res.total)
+        assertEquals(listOf("unblock_rejoin", "set_role", "credit_grant"), res.entries.map { it.action })
         val unblock = res.entries.first()
         assertNull(unblock.targetUserId)
         assertNull(unblock.targetEmail)

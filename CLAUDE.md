@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-vibi BFF — Kotlin/Ktor backend. **Perso AI** 프록시 (오디오 분리) + 로컬 ffmpeg 렌더 파이프라인 (multi-segment concat, BGM atrim+amix, audio override) + **Google / Apple Sign In** ID Token 검증 + **Postgres** user upsert + HS256 JWT 발급 + **크레딧/인앱결제** (StoreKit2 / Play Billing 영수증 검증) + **admin 대시보드** (읽기전용 분석) + 옵션 **Cloudflare R2** SigV4 presigned URL redirect.
+vibi BFF — Kotlin/Ktor backend. **Perso AI** 프록시 (오디오 분리) + 로컬 ffmpeg 렌더 파이프라인 (multi-segment concat, BGM atrim+amix, audio override) + **Google / Apple Sign In** ID Token 검증 + **Postgres** user upsert + HS256 JWT 발급 + **크레딧/인앱결제** (StoreKit2 / Play Billing 영수증 검증) + **admin 대시보드** (분석 + 크레딧 수동 지급 · 감사 로그) + 옵션 **Cloudflare R2** SigV4 presigned URL redirect.
 
 - **Stack**: Kotlin 2.0, Ktor 3.0.3, Netty, kotlinx.serialization, JDK 21, Exposed + HikariCP, Postgres
 - **Runtime deps**: `ffmpeg`, `ffprobe` on `PATH`; Postgres (Neon free tier 호환); Cloudflare R2 bucket (옵션)
@@ -56,7 +56,8 @@ GET    /api/v2/render/{id}/{status,download}
 POST   /api/v2/separate                   # audio-only multipart (m4a/mp3/wav, ≤100MB, 크레딧 reserve)
 GET    /api/v2/separate/{id}              # stem + 서명 URL
 GET    /api/v2/separate/{id}/stem/{stemId}        # token=*** 필수
-GET    /api/v2/admin/*                     # 읽기전용 대시보드 (overview/stats/users/jobs, admin role)
+GET    /api/v2/admin/*                     # 대시보드 조회 (overview/stats/users/jobs/credits/audit, admin role)
+POST   /api/v2/admin/users/{userId}/credits # 운영자 수동 크레딧 지급 (사유 필수, 감사 로그 적재)
 GET    /api/v2/testdata/separation/*      # (dev mock)
 ```
 

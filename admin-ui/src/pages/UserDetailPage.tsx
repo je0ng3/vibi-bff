@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   adminFetch,
+  adminPost,
   AdminAuthError,
   AdminCreditEvent,
+  AdminGrantCreditsResponse,
   AdminUserAccount,
   AdminUserCreditsResponse,
   AdminUserJobsResponse,
@@ -14,6 +16,8 @@ import DataTable from "../components/DataTable";
 
 const PAGE_SIZE = 50;
 const CREDITS_PAGE_SIZE = 50;
+// BFF AdminRoutes.MAX_ADMIN_GRANT_PER_CALL 과 동일 — 오조작(0 하나 더) 방어.
+const MAX_GRANT_PER_CALL = 500;
 
 // 크레딧 이벤트 type → 표시 라벨/배지. BFF AdminCreditEvent.type 과 1:1.
 const CREDIT_EVENT_LABEL: Record<string, string> = {
@@ -221,6 +225,8 @@ function CreditsSection({ userId }: { userId: string }) {
         <span className="text-xs text-neutral-500">현재 잔액 · 이력 {summary.total}건</span>
       </div>
 
+      <GrantCreditsForm userId={userId} onGranted={() => void load(0)} />
+
       {summary.hasMerges && (
         <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
           계정 병합 이력이 있는 사용자입니다. 흡수된 계정의 결제 이력이 감사 보존을 위해 이 계정으로
@@ -292,7 +298,113 @@ function CreditEventDetail({ event }: { event: AdminCreditEvent }) {
       </span>
     );
   }
+  // 관리자 지급은 "왜" 와 "누가" 가 감사의 핵심 — 사유 + 지급자를 함께 보여준다.
+  if (event.type === "admin_grant") {
+    return (
+      <span className="flex flex-wrap items-baseline gap-2">
+        <span>{event.detail ?? "사유 없음"}</span>
+        {event.actor && <span className="text-xs text-neutral-400">by {event.actor}</span>}
+      </span>
+    );
+  }
   return <span>{event.detail ?? "-"}</span>;
+}
+
+// BFF 가 던지는 error 코드 → 운영자용 한국어 문구. 미매핑 코드는 그대로 노출한다
+// (관리자 화면이라 raw 코드가 보여도 무해하고, 원인 파악에 오히려 도움).
+const GRANT_ERROR_MESSAGE: Record<string, string> = {
+  invalid_credits: `수량은 1~${MAX_GRANT_PER_CALL} 사이여야 합니다.`,
+  reason_required: "지급 사유를 입력해 주세요.",
+  reason_too_long: "사유는 200자 이내로 입력해 주세요.",
+  admin_grant_daily_cap_exceeded: "24시간 지급 한도를 초과했습니다. 내일 다시 시도해 주세요.",
+  "user not found": "사용자를 찾을 수 없습니다.",
+};
+
+// 운영자 수동 크레딧 지급. 사유는 필수 — 서버도 거부하지만 여기서 먼저 막아 왕복을 아낀다.
+// 성공하면 상위 타임라인을 처음부터 다시 읽어 방금 지급분이 바로 보이게 한다.
+function GrantCreditsForm({ userId, onGranted }: { userId: string; onGranted: () => void }) {
+  const navigate = useNavigate();
+  const [credits, setCredits] = useState("");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [granted, setGranted] = useState<number | null>(null);
+  // 지급은 멱등이 아니다 (호출 1회 = 지급 1회). state 는 리렌더 후에야 갱신돼 같은 렌더에서
+  // 두 번 발생한 Enter/클릭을 막지 못하므로, 실제 가드는 ref 로 건다.
+  const inFlight = useRef(false);
+
+  const amount = Number.parseInt(credits, 10);
+  const valid = Number.isInteger(amount) && amount >= 1 && amount <= MAX_GRANT_PER_CALL && reason.trim().length > 0;
+
+  const submit = async () => {
+    if (!valid || inFlight.current) return;
+    inFlight.current = true;
+    setSubmitting(true);
+    setError(null);
+    setGranted(null);
+    try {
+      const res = await adminPost<AdminGrantCreditsResponse>(
+        `/api/v2/admin/users/${userId}/credits`,
+        { credits: amount, reason: reason.trim() },
+      );
+      setCredits("");
+      setReason("");
+      setGranted(res.granted);
+      onGranted();
+    } catch (e) {
+      if (e instanceof AdminAuthError) {
+        navigate("/login", { replace: true });
+        return;
+      }
+      const code = e instanceof Error ? e.message : "";
+      setError(GRANT_ERROR_MESSAGE[code] ?? `지급 실패 (${code || "unknown"})`);
+    } finally {
+      inFlight.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="rounded border border-neutral-200 bg-neutral-50 p-3">
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1 text-xs text-neutral-600">
+          수량
+          <input
+            type="number"
+            min={1}
+            max={MAX_GRANT_PER_CALL}
+            value={credits}
+            onChange={(e) => setCredits(e.target.value)}
+            className="w-24 rounded border border-neutral-300 px-2 py-1.5 text-sm tabular-nums"
+            placeholder="10"
+          />
+        </label>
+        <label className="flex min-w-[16rem] flex-1 flex-col gap-1 text-xs text-neutral-600">
+          지급 사유 (필수)
+          <input
+            type="text"
+            value={reason}
+            maxLength={200}
+            onChange={(e) => setReason(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void submit(); }}
+            className="rounded border border-neutral-300 px-2 py-1.5 text-sm"
+            placeholder="예: 분리 실패 보상"
+          />
+        </label>
+        <button
+          onClick={() => void submit()}
+          disabled={!valid || submitting}
+          className="rounded bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-40"
+        >
+          {submitting ? "지급 중…" : "크레딧 지급"}
+        </button>
+      </div>
+      {error && <p className="mt-2 text-xs text-rose-600">{error}</p>}
+      {granted !== null && !error && (
+        <p className="mt-2 text-xs text-emerald-700">{granted} 크레딧을 지급했습니다.</p>
+      )}
+    </div>
+  );
 }
 
 // 계정에 연결된 로그인 수단. 병합 이력(흡수된 계정·이월 크레딧)은 크레딧 타임라인의
