@@ -53,7 +53,6 @@ private val log = LoggerFactory.getLogger("com.vibi.bff.routes.CreditRoutes")
 fun Route.creditRoutes(
     creditRepository: CreditRepository,
     userRepository: UserRepository,
-    /** `/admin-grant` 가 admin 대시보드와 같은 지급·감사·한도 경로를 공유하기 위한 의존성. */
     adminRepository: AdminRepository,
     appleVerifier: AppleReceiptVerifier?,
     googleVerifier: GoogleReceiptVerifier?,
@@ -169,13 +168,8 @@ fun Route.creditRoutes(
         }
 
         // 관리자 무료 충전 (자가) — receipt 검증 없이 자기 잔액 가산. 운영자 테스트·시연용.
-        //
-        // 실제 지급은 admin 대시보드의 수동 지급과 **같은 경로**([AdminRepository.grantCredits])를
-        // 탄다: 같은 24h 한도(지급자 기준, admin_audit_log 집계) + 같은 감사 로그. 두 엔드포인트가
-        // 서로 다른 소스로 한도를 세면 한쪽으로 우회해 두 배를 발행할 수 있고, 이쪽 지급만 감사에
-        // 안 남으면 "누가 얼마를 넣었나" 추적이 반쪽이 된다.
-        //
-        // 금액은 [CreditCatalog] SKU 로 고정 (임의 금액은 대시보드 쪽 endpoint 담당).
+        // 지급은 대시보드 수동 지급과 같은 [AdminRepository.grantCredits] 를 타 24h 한도·감사
+        // 로그를 공유한다 (따로 세면 한쪽으로 우회 가능). 금액은 [CreditCatalog] SKU 로 고정.
         post("/admin-grant") {
             val principal = call.requireAdmin(jwtSecret)
             val req = call.receive<AdminGrantRequest>()

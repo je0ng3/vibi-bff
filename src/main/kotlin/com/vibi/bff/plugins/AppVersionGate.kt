@@ -19,20 +19,12 @@ import org.slf4j.LoggerFactory
 const val HEADER_APP_VERSION = "X-App-Version"
 
 /**
- * 최소 지원 앱 버전 게이트. `MIN_APP_VERSION` (예 `1.1.0`) 미만 모바일 클라이언트의 요청을
- * **426 Upgrade Required** 로 끊어 강제 업데이트를 유도한다. env 미설정이면 게이트 자체가 꺼진다
- * (fail-open — 기본은 기존 동작 그대로).
+ * 최소 지원 앱 버전 게이트. `MIN_APP_VERSION` (예 `1.1.0`) 미만 모바일 요청을 **426 Upgrade
+ * Required** 로 끊는다. env 미설정이면 게이트가 꺼진다 (fail-open).
  *
- * 판정:
- * - [HEADER_APP_VERSION] 헤더가 있으면 그 값으로 비교. 파싱 불가한 값(앱이 번들에서 버전을 못 읽어
- *   보내는 `unknown` 등)은 통과 — 헤더를 싣는다는 것 자체가 헤더 도입(1.1.0) 이후 빌드라는 뜻이라,
- *   조회 실패로 사용자를 업데이트 화면에 가두는 fail-closed 를 피한다.
- * - 헤더가 없으면 헤더 도입(모바일 1.1.0) **이전 빌드**로 보되, 모바일이라고 확인되는 요청만
- *   막는다 — JWT `client` claim 이 `mobile` 이거나, 모바일 전용 로그인 교환 경로일 때.
- *   UXP 패널(device-flow, claim `plugin`)·admin SPA·SSV 콜백은 헤더가 없어도 통과한다.
- *
- * 게이트 대상은 `/api/v2` 아래 앱 API 뿐 — health probe·device 로그인 페이지·admin·정적 리소스는
- * 건드리지 않는다.
+ * 헤더가 있으면 그 값으로 비교하되 파싱 불가한 값(`unknown` 등)은 통과 — 헤더를 싣는다는 것 자체가
+ * 헤더 도입(1.1.0) 이후 빌드라, 버전 조회 실패로 사용자를 업데이트 화면에 가두지 않는다.
+ * 헤더가 없으면 [isLegacyMobileClient] 로 모바일이 확인될 때만 막는다.
  */
 fun Application.configureAppVersionGate(jwtSecret: String) {
     val log = LoggerFactory.getLogger("com.vibi.bff.plugins.AppVersionGate")
@@ -73,10 +65,7 @@ fun Application.configureAppVersionGate(jwtSecret: String) {
 /** 모바일 전용 ID Token 교환 — UXP 패널은 device-flow 를 쓰므로 이 경로로 들어오지 않는다. */
 private val MOBILE_LOGIN_PATHS = setOf("/api/v2/auth/google", "/api/v2/auth/apple")
 
-/**
- * 게이트를 적용할 경로인지. 앱 API(`/api/v2`) 만 대상이며, 그 안에서도 앱이 아닌 호출자가 쓰는
- * 경로는 제외한다 — device-flow 로그인(UXP 패널), admin, AdMob SSV 서버 콜백.
- */
+/** 앱 API(`/api/v2`) 만 대상. 앱이 아닌 호출자의 경로(UXP device-flow·admin·SSV 콜백)는 제외. */
 private fun String.isVersionGated(): Boolean {
     if (!startsWith("/api/v2/")) return false
     if (startsWith("/api/v2/admin")) return false
@@ -87,12 +76,11 @@ private fun String.isVersionGated(): Boolean {
 }
 
 /**
- * 버전 헤더가 없는 요청이 "헤더 도입 이전 모바일 빌드" 인지. 서명 검증을 통과한 JWT 의
- * `client` claim 이 유일한 근거 — 위조 토큰으로 게이트를 통과당하지 않게 [requireUser] 와 동일한
- * 검증을 쓴다. 토큰이 없으면 모바일 전용 로그인 경로일 때만 구버전으로 본다.
+ * 헤더 없는 요청이 "헤더 도입(1.1.0) 이전 모바일 빌드" 인지. 근거는 서명 검증을 통과한 JWT 의
+ * `client` claim 뿐이고, 토큰이 없으면 모바일 전용 로그인 경로일 때만 구버전으로 본다.
  *
- * 검증 실패(만료·위조)는 호출자를 알 수 없는 상태 — 게이트가 삼키지 않고 통과시켜 라우트의
- * 인증이 401 을 내게 둔다. 만료된 패널 토큰이 426 으로 둔갑해 재로그인 흐름이 깨지는 것 방지.
+ * 검증 실패(만료·위조)는 통과시켜 라우트 인증이 401 을 내게 둔다 — 만료된 패널 토큰이 426 으로
+ * 둔갑하면 재로그인 흐름이 깨진다.
  */
 private fun ApplicationCall.isLegacyMobileClient(jwtSecret: String, path: String): Boolean {
     val token = request.header("Authorization")
