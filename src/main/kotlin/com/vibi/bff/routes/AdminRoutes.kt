@@ -36,21 +36,15 @@ import org.slf4j.LoggerFactory
 
 private val adminLog = LoggerFactory.getLogger("com.vibi.bff.routes.AdminRoutes")
 
-/**
- * 수동 지급 1회당 상한. 오조작(0 하나 더 입력) 방어 — 더 큰 금액이 필요하면 나눠 지급한다.
- * 24h 총량은 별도로 `ADMIN_GRANT_DAILY_CAP` (default 1000) 이 지급자 기준으로 제한.
- */
+/** 수동 지급 1회당 상한 — 오조작(0 하나 더) 방어. 24h 총량은 [adminGrantDailyCap] 이 따로 제한. */
 const val MAX_ADMIN_GRANT_PER_CALL = 500
 
-/** 지급 사유 최대 길이 — admin_audit_log.detail 컬럼(varchar 500) 보다 넉넉히 짧게. */
+/** 지급 사유 최대 길이 — admin_audit_log.detail(varchar 500) 보다 짧게. */
 private const val MAX_GRANT_REASON_LENGTH = 200
 
 /**
- * 운영자 1인이 24h 동안 지급할 수 있는 크레딧 총량. admin JWT 유출 시 피해 상한.
- * `/admin/users/{id}/credits` 와 `/credits/admin-grant` 가 **같은 한도를 공유**한다 — 한쪽으로
- * 우회해 두 배를 발행하지 못하도록 (집계 소스도 admin_audit_log 하나).
- *
- * `.env` 로도 설정 가능해야 하므로 [envOrProperty] 사용 (System.getenv 만 보면 .env 가 무시된다).
+ * 운영자 1인이 24h 동안 지급할 수 있는 총량 — admin JWT 유출 시 피해 상한.
+ * `/admin/users/{id}/credits` 와 `/credits/admin-grant` 가 같은 한도를 공유한다 (우회 방지).
  */
 internal fun adminGrantDailyCap(): Int = envOrProperty("ADMIN_GRANT_DAILY_CAP")?.toIntOrNull() ?: 1000
 
@@ -186,8 +180,7 @@ fun Route.adminRoutes(
             call.respond(HttpStatusCode.OK, data)
         }
 
-        // 사용자별 크레딧 변동 타임라인 — 가입 보너스/구매/광고/관리자 지급/분리 차감/환불/
-        // 병합 이월을 한 스트림으로 (최신순, limit·offset 공유 규약).
+        // 사용자별 크레딧 변동 타임라인 (최신순).
         get("/users/{userId}/credits") {
             call.requireAdmin(jwtSecret)
             val userId = call.parseUserId()
@@ -199,11 +192,7 @@ fun Route.adminRoutes(
         }
 
         // 운영자 수동 크레딧 지급 — 결제 오류 보상 / 심사용 계정 충전 등. body {credits, reason}.
-        // 지급 즉시 잔액이 오르고 admin_audit_log 에 (지급자·수령자·수량·사유) 가 남으며, 같은
-        // 내역이 위 타임라인의 '관리자 지급' 이벤트로도 보인다.
-        //
-        // 사유(reason)를 필수로 받는 이유: 감사 로그의 값은 "왜" 에 있다. 사유 없는 지급은
-        // 나중에 부정 사용과 정상 보상을 구분할 수 없다.
+        // 사유가 필수인 이유: 사유 없는 지급은 나중에 부정 사용과 정상 보상을 구분할 수 없다.
         post("/users/{userId}/credits") {
             val principal = call.requireAdmin(jwtSecret)
             val userId = call.parseUserId()
@@ -219,8 +208,7 @@ fun Route.adminRoutes(
                 throw ApiErrorException(HttpStatusCode.BadRequest, "reason_too_long", "max $MAX_GRANT_REASON_LENGTH")
             }
 
-            // 상한 검사는 repository 가 지급과 같은 트랜잭션 + 지급자 행 잠금 안에서 수행한다
-            // (여기서 미리 조회하면 검사와 지급 사이에 동시 요청이 끼어드는 TOCTOU 가 생긴다).
+            // 상한 검사는 repository 가 지급과 같은 트랜잭션 안에서 수행한다 (TOCTOU 방지).
             val result = withContext(Dispatchers.IO) {
                 adminRepository.grantCredits(
                     targetUserId = userId,
@@ -323,10 +311,7 @@ fun Route.adminRoutes(
     }
 }
 
-/**
- * `{userId}` path 파라미터를 UUID 로 파싱. 누락은 404, 형식 오류는 400 `invalid_user_id`.
- * `/users/{userId}/...` 하위 핸들러들이 공유.
- */
+/** `{userId}` 파싱. 누락은 404, 형식 오류는 400 `invalid_user_id`. */
 private fun ApplicationCall.parseUserId(): UUID {
     val raw = parameters["userId"] ?: throw NotFoundException("userId required")
     return try {

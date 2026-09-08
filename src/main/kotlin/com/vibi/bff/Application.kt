@@ -320,6 +320,9 @@ fun Application.module() {
     configureSerialization()
     configureCors()
     configureRateLimiting(appConfig.auth.jwtSecret)
+    // 최소 지원 앱 버전 게이트 — MIN_APP_VERSION 설정 시에만 동작. 라우팅보다 앞에 둬야
+    // 구버전 요청이 실제 핸들러(=비용 발생 경로)에 닿기 전에 끊긴다.
+    configureAppVersionGate(appConfig.auth.jwtSecret)
     configureErrorHandling()
     configureRouting(
         fileStorage, persoClient, appConfig, renderService,

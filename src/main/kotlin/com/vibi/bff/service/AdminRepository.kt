@@ -62,24 +62,19 @@ private fun round1(v: Double): Double = Math.round(v * 10.0) / 10.0
 const val ADMIN_GRANT_PRODUCT_ID = "admin.grant"
 
 /**
- * [AdminRepository.grantCredits] 결과. 실패 사유를 예외 대신 타입으로 돌려주는 이유: 둘 다
- * 정상적인 운영 흐름(오타난 userId / 한도 도달)이고, 라우트가 각각 404·429 로 다르게 매핑해야 한다.
+ * [AdminRepository.grantCredits] 결과. 실패를 예외 대신 타입으로 돌려주는 이유: 둘 다 정상적인
+ * 운영 흐름이고 라우트가 각각 404·429 로 다르게 매핑해야 한다.
  */
 sealed interface AdminGrantResult {
-    /** 지급 성공. [transactionId] 는 credit_transactions 의 서버 생성 키 (응답 echo 용). */
     data class Granted(val granted: Int, val balance: Int, val transactionId: String) : AdminGrantResult
 
-    /** 대상 사용자 없음 (오타 / 이미 탈퇴). */
     data object TargetNotFound : AdminGrantResult
 
-    /** 지급자의 24h 상한 초과. [grantedRecently] 는 창 안에서 이미 지급한 합. */
+    /** [grantedRecently] 는 24h 창 안에서 이미 지급한 합. */
     data class CapExceeded(val grantedRecently: Int, val cap: Int) : AdminGrantResult
 }
 
-/**
- * `admin_audit_log.action` 값. 컬럼별 의미는 action 마다 다르다 —
- * [AdminRepository.recordAudit] KDoc + V19 마이그레이션 주석 참조.
- */
+/** `admin_audit_log.action` 값. */
 object AdminAuditAction {
     const val CREDIT_GRANT = "credit_grant"
     const val SET_ROLE = "set_role"
@@ -95,15 +90,14 @@ private fun medianOf(values: List<Long>): Double {
 }
 
 /**
- * admin 대시보드 쿼리. 대부분 read-only 집계이고, mutating 은 셋뿐 — [setUserRole],
- * [grantCredits], [recordAudit]. mutating 액션은 전부 `admin_audit_log` 에 흔적을 남긴다.
+ * admin 대시보드 쿼리. mutating 액션([grantCredits] · [setUserRoleAudited] ·
+ * [unblockRejoinAudited])은 전부 `admin_audit_log` 에 흔적을 남긴다.
  *
  * 집계 쿼리는 raw SQL — Exposed 의 group-by/aggregation API 로도 가능하나 raw 가 가독성 우위.
  * Postgres + H2 (PostgreSQL mode) 양쪽에서 동일 구문이 동작하는지 확인된 SQL 만 사용.
  * (INSERT/UPDATE 는 반대로 Exposed DSL — 타입 안전 + 갱신 row 수를 그대로 받는다.)
  */
 class AdminRepository(
-    /** 사용자 대면 경로와 로직을 공유하기 위한 의존성 ([getUserAccount] · [unblockRejoinAudited]). */
     private val userRepository: UserRepository,
 ) {
 
@@ -592,44 +586,28 @@ class AdminRepository(
     }
 
     /**
-     * 사용자 상세 페이지용 — 계정에 연결된 로그인 수단.
-     *
-     * [UserRepository.listIdentities] 재사용 (users primary + user_identities secondary). 사용자 대면
-     * GET /auth/identities 와 단일 소스라 조립 로직이 어긋나지 않는다. 없는 userId 는 빈 리스트.
-     *
-     * 병합 이력은 여기서 반환하지 않는다 — 같은 account_merges row 를 [getUserCredits] 의
-     * 타임라인이 'merge_carry' 이벤트로 이미 보여준다 (표시 정본 1곳).
+     * 계정에 연결된 로그인 수단. 사용자 대면 GET /auth/identities 와 같은 소스를 재사용한다.
+     * 병합 이력은 [getUserCredits] 의 'merge_carry' 이벤트가 정본이라 여기서 반환하지 않는다.
      */
     fun getUserAccount(userId: UUID): AdminUserAccount =
         transaction { AdminUserAccount(identities = userRepository.listIdentities(userId)) }
 
     /**
-     * 사용자 상세 페이지용 — 크레딧 변동 타임라인 (최신순, 페이지네이션).
-     *
-     * 세 소스를 `UNION ALL` 한 뒤 정렬·페이징한다. 소스별로 나눠 조회한 뒤 코틀린에서 합치면
-     * 페이지 경계가 어긋나므로(각각 limit 을 적용하게 됨) 한 쿼리로 뽑는다:
-     *   • credit_transactions — purchase / ad_reward(admob) / admin_grant(admin)
-     *   • credit_ledger       — signup / separation(consume, 음수) / refund
-     *   • account_merges      — merge_carry (이월 크레딧)
-     *
-     * consume/refund 의 ref_id 는 "consume-<jobId>" / "refund-<jobId>" 라 접두사를 떼 잡 ID 를
-     * 얻고, 페이지가 확정된 뒤 그 ID 들만 separation_jobs(TEXT PK) 에서 조회해 입력 길이를 붙인다
-     * — "몇 분짜리 분리로 몇 개 차감" 표시용. 잡 row 가 이미 없으면 길이만 null 이고 이벤트는 남는다.
-     *
-     * 반환 [AdminUserCreditsResponse.balance] 와 이벤트 delta 합계가 어긋날 수 있는 이유는
-     * 해당 DTO 의 KDoc 참조 (계정 병합의 re-point). hasMerges 로 UI 가 경고를 띄운다.
+     * 크레딧 변동 타임라인 (최신순, 페이지네이션). 세 소스를 `UNION ALL` 로 한 쿼리에 뽑는다 —
+     * 소스별로 나눠 조회하면 각각 limit 이 걸려 페이지 경계가 어긋난다:
+     *   • credit_transactions — purchase / ad_reward / admin_grant
+     *   • credit_ledger       — signup / separation(음수) / refund
+     *   • account_merges      — merge_carry
      */
     fun getUserCredits(userId: UUID, limit: Int, offset: Int): AdminUserCreditsResponse = transaction {
         require(limit in 1..200) { "limit must be in 1..200 (got $limit)" }
         require(offset >= 0) { "offset must be >= 0 (got $offset)" }
 
-        // user_credits row 가 없는 사용자(보너스 지급 전/이력 없음)도 0 으로 떨어지도록 스칼라
-        // 서브쿼리 + COALESCE — scalarLong 은 결과 row 가 없으면 JDBC 레벨에서 터진다.
+        // user_credits row 가 없는 사용자도 0 으로 — scalarLong 은 결과 row 가 없으면 실패한다.
         val balance = scalarLong(
             "SELECT COALESCE((SELECT balance FROM user_credits WHERE user_id = ?), 0)",
             listOf(uuidArg(userId)),
         ).toInt()
-        // 전체 건수 + 병합 유무를 한 번에 (세 소스를 각각 COUNT 하면 왕복만 늘어난다).
         var total = 0L
         var mergeCount = 0L
         val countSql = """
@@ -646,12 +624,8 @@ class AdminRepository(
             }
         }
 
-        // 'day' 처럼 예약어 충돌을 피하려 별칭은 at/ev_type 사용. NULL 컬럼은 UNION 의 타입
-        // 결정을 위해 CAST 필수 (H2 는 캐스트 없는 NULL 컬럼의 UNION 을 거부).
-        //
-        // ev_id 는 "<소스>:<PK>" 로 전역 유니크 — 같은 시각에 여러 이벤트가 몰려도 정렬이
-        // 결정적이라 페이지 경계에서 행이 중복/누락되지 않는다. 클라이언트의 append 중복 제거
-        // 키로도 쓰인다 (offset 페이징 중 새 이벤트가 생겨 경계가 밀리는 경우 방어).
+        // NULL 컬럼의 CAST 는 필수 — H2 는 캐스트 없는 NULL 컬럼의 UNION 을 거부한다.
+        // ev_id 는 전역 유니크라 같은 시각 이벤트가 몰려도 정렬이 결정적 (페이지 경계 중복/누락 방어).
         val sql = """
             SELECT ev_id, at, ev_type, delta, detail, job_id, source_duration_ms
             FROM (
@@ -715,10 +689,8 @@ class AdminRepository(
             }
         }
 
-        // 입력 길이는 페이지에 실제로 뜬 잡(<= limit 건)만 PK 조회로 보강한다. UNION 안에서
-        // separation_jobs 를 LEFT JOIN 하면 LIMIT 전에 조인이 끝나야 해서, Postgres 가
-        // separation_jobs 전체를 해시로 올리고 사용자의 ledger 전 구간을 조인한다 (테이블이
-        // 커질수록 페이지 1장 여는 비용이 같이 커짐). 조인을 밖으로 빼 두 단계 모두 bounded.
+        // 입력 길이는 페이지에 뜬 잡만 PK 조회로 보강 — UNION 안에서 LEFT JOIN 하면 LIMIT 전에
+        // separation_jobs 전체와 조인해 페이지 1장 여는 비용이 테이블 크기를 따라간다.
         val jobIds = events.mapNotNull { it.jobId }.distinct()
         if (jobIds.isNotEmpty()) {
             val durations = HashMap<String, Long>(jobIds.size)
@@ -735,9 +707,7 @@ class AdminRepository(
             }
         }
 
-        // 관리자 지급의 사유·지급자는 admin_audit_log 에만 있다 (credit_transactions 에는 넣을
-        // 컬럼이 없고, product_id 를 사유로 전용하면 카탈로그 의미가 깨진다). 잡 길이와 같은
-        // 방식으로 페이지에 뜬 tx PK 만 bounded 조회 — UNION 안에서 조인하지 않는다.
+        // 관리자 지급의 사유·지급자는 admin_audit_log 에만 있다. 위와 같은 이유로 bounded 조회.
         val grantTxIds = events
             .filter { it.type == "admin_grant" }
             .mapNotNull { it.id.removePrefix("tx:").toLongOrNull() }
@@ -758,7 +728,7 @@ class AdminRepository(
                 if (e.type != "admin_grant") return@replaceAll e
                 val hit = e.id.removePrefix("tx:").toLongOrNull()?.let { audits[it] }
                     ?: return@replaceAll e
-                // 사유가 비어있으면(옛 /credits/admin-grant 경로) product_id 를 그대로 둔다.
+                // 사유가 없는 옛 지급분은 product_id 를 그대로 둔다.
                 e.copy(detail = hit.first ?: e.detail, actor = hit.second)
             }
         }
@@ -817,25 +787,12 @@ class AdminRepository(
     }
 
     /**
-     * 운영자 수동 크레딧 지급. 상한 검사 → 지급 → 감사 기록을 **한 트랜잭션**으로 묶는다.
+     * 운영자 수동 크레딧 지급. 상한 검사 → 지급 → 감사 기록이 **한 트랜잭션** — 검사와 지급 사이에
+     * 틈이 있으면 동시 요청 2건이 같은 잔여 한도를 읽고 둘 다 통과한다 (TOCTOU). 지급자 row 를
+     * `FOR UPDATE` 로 잠가 같은 운영자의 지급끼리만 직렬화한다.
      *
-     * 원자성이 load-bearing 인 이유가 둘이다:
-     *  1. 크레딧만 오르고 감사 row 가 없는(= 추적 불가능한) 상태를 만들지 않는다.
-     *  2. 24h 상한 검사와 지급이 같은 트랜잭션 + 같은 행 잠금 안에서 일어나야 동시 요청 2건이
-     *     같은 잔여 한도를 읽고 둘 다 통과하는 TOCTOU 가 없다. 지급자(users) row 를
-     *     `SELECT ... FOR UPDATE` 로 잠가 **같은 운영자의 지급끼리만** 직렬화한다 (다른 운영자는
-     *     서로 막지 않는다). 상한이 임의 금액 지급의 유일한 방어선이라 검사-후-삽입 사이에 틈을
-     *     두지 않는다.
-     *
-     * IAP 경로와 같은 (platform='admin', transaction_id) UNIQUE 를 쓰지만 transaction_id 를
-     * 서버가 생성하므로 충돌은 없다 (호출 1회 = 지급 1회. 중복 제출 방어는 호출자 책임).
-     *
-     * platform='admin' 으로 남는 덕에 계정 병합의 "획득 크레딧" SUM
-     * ([UserRepository.mergeAccounts])에도 포함된다 — 운영자가 보상한 크레딧은 무료 보너스와
-     * 달리 병합 시 이월 대상이라는 의미이며, 이는 의도된 동작이다.
-     *
-     * 사용자 대면 `POST /credits/admin-grant` (운영자 자가 충전) 도 이 메서드를 탄다 — 두 경로가
-     * 같은 24h 한도·같은 감사 로그를 공유하게 해 한쪽으로 우회하지 못하도록.
+     * `POST /credits/admin-grant` (운영자 자가 충전) 도 이 메서드를 타 24h 한도·감사 로그를 공유한다.
+     * platform='admin' 이라 병합 시 "획득 크레딧" 이월 대상에 포함된다 (의도된 동작).
      */
     fun grantCredits(
         targetUserId: UUID,
@@ -846,9 +803,7 @@ class AdminRepository(
     ): AdminGrantResult = transaction {
         require(credits > 0) { "credits must be positive (got $credits)" }
 
-        // 지급자 row 잠금 — 아래 SUM 과 INSERT 사이를 같은 운영자 기준으로 직렬화. 운영자 계정이
-        // 이미 삭제된 stale JWT 면 잠글 row 가 없어 직렬화가 없지만, 그 경우 상한 SUM 도
-        // (actor_user_id NULL 로 끊겨) 0 이라 어차피 의미가 없다.
+        // 지급자 row 잠금 — 아래 SUM 과 INSERT 사이를 같은 운영자 기준으로 직렬화.
         UsersTable
             .select(UsersTable.id)
             .where { UsersTable.id eq actorUserId }
@@ -898,10 +853,7 @@ class AdminRepository(
         )
     }
 
-    /**
-     * role 변경 + 감사 기록을 한 트랜잭션으로. 갱신 row 수(0 = 존재하지 않는 사용자) 반환.
-     * 변경만 커밋되고 감사 기록이 유실되는 창을 없앤다 ([grantCredits] 와 같은 규약).
-     */
+    /** role 변경 + 감사 기록을 한 트랜잭션으로. 갱신 row 수(0 = 존재하지 않는 사용자) 반환. */
     fun setUserRoleAudited(userId: UUID, actorUserId: UUID, role: String): Int = transaction {
         val updated = setUserRole(userId, role)
         if (updated > 0) {
@@ -916,10 +868,8 @@ class AdminRepository(
     }
 
     /**
-     * 재가입 차단 해제 + 감사 기록을 한 트랜잭션으로. 실제로 지운 경우만 기록한다 — 이미
-     * 해제/만료된 대상의 재클릭까지 남기면 로그가 흐려진다.
-     *
-     * 대상은 탈퇴자라 users row 가 없다 → target_user_id 는 null 이고 detail 에 identity 해시를 담는다.
+     * 재가입 차단 해제 + 감사 기록을 한 트랜잭션으로. 실제로 지운 경우만 기록한다.
+     * 대상은 탈퇴자라 users row 가 없다 → target_user_id 는 null, detail 에 identity 해시.
      */
     fun unblockRejoinAudited(identityHash: String, actorUserId: UUID): Boolean = transaction {
         val removed = userRepository.unblockRejoin(identityHash)
@@ -934,20 +884,11 @@ class AdminRepository(
     }
 
     /**
-     * 감사 로그 1건 적재 (append-only). [actorUserId] 의 이메일은 지금 조회해 denormalize —
-     * 운영자 계정이 나중에 삭제돼도 "누가 했는지" 가 남는다 (삭제 정책의 의도적 예외. V19 주석 참조).
+     * 감사 로그 1건 적재 (append-only). 이메일은 지금 조회해 denormalize — 운영자 계정이 삭제돼도
+     * "누가 했는지" 가 남는다 (삭제 정책의 의도적 예외. V19 주석 참조).
      *
      * **직접 호출보다 액션별 래퍼를 쓸 것** ([grantCredits] · [setUserRoleAudited] ·
-     * [unblockRejoinAudited]) — 변경과 기록이 한 트랜잭션으로 묶여야 "변경은 됐는데 기록은 없는"
-     * 상태가 생기지 않는다. 이 메서드는 그 래퍼들이 쓰는 프리미티브다.
-     *
-     * action 별 컬럼 의미:
-     *   • credit_grant   — [targetUserId]=수령자, [amount]=지급 크레딧, [detail]=사유, [creditTransactionId] 채움
-     *   • set_role       — [targetUserId]=대상, [detail]=새 role
-     *   • unblock_rejoin — [targetUserId]=null (탈퇴자), [detail]=identity 해시
-     *
-     * 중첩 호출 안전 — Exposed 는 열린 트랜잭션이 있으면 그것을 재사용한다 ([grantCredits] 가
-     * 자기 트랜잭션 안에서 호출).
+     * [unblockRejoinAudited]) — 변경과 기록이 한 트랜잭션으로 묶여야 유실 창이 없다.
      */
     fun recordAudit(
         actorUserId: UUID,
@@ -971,8 +912,7 @@ class AdminRepository(
                 it[AdminAuditLogTable.action] = action
                 it[AdminAuditLogTable.targetUserId] = targetUserId
                 it[AdminAuditLogTable.amount] = amount
-                // detail 컬럼은 varchar(500) — 라우트가 이미 길이를 검증하지만 DB 제약 위반으로
-                // 500 이 나는 것보다 잘라서 기록하는 편이 감사 로그의 목적에 맞다.
+                // varchar(500) — 제약 위반으로 500 을 내는 것보다 잘라서 기록한다.
                 it[AdminAuditLogTable.detail] = detail?.take(500)
                 it[AdminAuditLogTable.creditTransactionId] = creditTransactionId
                 it[AdminAuditLogTable.createdAt] = now
@@ -981,12 +921,8 @@ class AdminRepository(
     }
 
     /**
-     * [actorUserId] 가 [since] 이후 수동 지급한 크레딧 합. 지급자 기준 24h 상한 enforcement 용 —
-     * admin JWT 가 유출돼도 무제한 발행을 막는다. **수령자가 아니라 지급한 쪽**을 세는 것이
-     * 핵심 (여러 계정에 나눠 지급해 상한을 우회하는 경로 차단).
-     *
-     * 상한 검사는 [grantCredits] 가 자기 트랜잭션 안에서 수행하므로, 이 public 진입점은 조회
-     * (대시보드/디버깅) 전용이다.
+     * [actorUserId] 가 [since] 이후 지급한 크레딧 합 (조회 전용 — enforcement 는 [grantCredits] 안).
+     * 수령자가 아니라 **지급한 쪽**을 세는 것이 핵심 (여러 계정에 나눠 지급하는 우회 차단).
      */
     fun grantedByActorSince(actorUserId: UUID, since: Instant): Int = transaction {
         grantedByActorSinceInTx(actorUserId, since)
@@ -1000,10 +936,7 @@ class AdminRepository(
             listOf(uuidArg(actorUserId), textArg(AdminAuditAction.CREDIT_GRANT), instantArg(since)),
         ).toInt()
 
-    /**
-     * 감사 로그 페이지 (최신순) + 전체 건수. 대상 이메일은 현재 users row 에서 채우므로
-     * 탈퇴한 사용자는 null 로 뜬다 (감사 row 자체는 FK SET NULL 로 남는다).
-     */
+    /** 감사 로그 페이지 (최신순) + 전체 건수. 탈퇴한 대상의 이메일은 null (감사 row 는 남는다). */
     fun listAudit(limit: Int, offset: Int): AdminAuditResponse = transaction {
         require(limit in 1..200) { "limit must be in 1..200 (got $limit)" }
         require(offset >= 0) { "offset must be >= 0 (got $offset)" }
